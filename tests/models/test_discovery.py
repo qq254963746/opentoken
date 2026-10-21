@@ -96,6 +96,38 @@ def test_extract_doubao_models_from_html_returns_current_action_bar_models() -> 
     ]
 
 
+def test_extract_doubao_models_from_html_reads_current_mode_select_config() -> None:
+    """The picker moved to `modeSelectConfig.menu_item_list`; each item nests an
+    `option_list` array (reasoning effort), so a non-greedy regex truncates the
+    payload. Only chat-capable entries ("工作任务 …" is office-only) belong in
+    /v1/models, and labels may carry a "豆包 " prefix."""
+    html = """
+    <script>
+    {"modeSelectConfig":{"menu_item_list":[
+      {"item_id":0,"menu_type":0,"model_item_key":"0","name":"快速",
+       "conversation_mode_list":["chat","creation"],
+       "reasoning_effort_config":{"option_list":[{"level":3,"name":"低"},{"level":4,"name":"中"}]}},
+      {"item_id":3,"menu_type":3,"model_item_key":"3","name":"豆包 专家",
+       "conversation_mode_list":["chat","creation"],
+       "reasoning_effort_config":{"option_list":[{"level":3,"name":"低"}]}},
+      {"item_id":9,"menu_type":9,"model_item_key":"9","name":"工作任务 Auto",
+       "conversation_mode_list":["office","creation"]},
+      {"item_id":10001,"menu_type":10001,"model_item_key":"seed-lite-7b","name":"豆包 2.1 Lite",
+       "conversation_mode_list":["office","creation"]}
+    ]},"modeSelectData":{"defaultModeSelectValue":"0"}}
+    </script>
+    """
+
+    assert _extract_doubao_models_from_html(html) == [
+        ("doubao-seed-2.0", "Doubao 快速"),
+        ("doubao-pro", "Doubao 专家"),
+    ]
+
+
+def test_extract_doubao_models_from_html_returns_empty_when_menu_missing() -> None:
+    assert _extract_doubao_models_from_html("<html><body>豆包</body></html>") == []
+
+
 def test_extract_glm_cn_models_from_html_returns_meta_models() -> None:
     html = """
     <html>

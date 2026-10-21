@@ -155,9 +155,10 @@ def test_models_endpoint_works_over_real_http(http_server) -> None:
     # we still expect over HTTP: every entry is OpenAI-shaped with owned_by ==
     # "opentoken".
     for item in payload["data"]:
-        assert set(item.keys()) == {"id", "object", "owned_by"}
+        assert set(item.keys()) == {"id", "object", "owned_by", "capability"}
         assert item["object"] == "model"
         assert item["owned_by"] == "opentoken"
+        assert item["capability"] in {"text", "image", "video", "audio"}
 
 
 def test_post_endpoints_require_auth_over_real_http(http_server) -> None:

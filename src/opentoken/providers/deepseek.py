@@ -83,8 +83,24 @@ class DeepSeekWebClient:
         data = payload.get("data")
         if not isinstance(data, dict):
             raise RuntimeError(f"DeepSeek session creation returned no data section.")
+        # Upstream grew an extra nesting level: the session used to be
+        # `data.biz_data.id`, but current builds return
+        # `data.biz_data.chat_session.id`. Accept both plus the pre-existing
+        # `chat_session_id` spelling so a wire change never silently degrades
+        # into "no session id" again.
         session = data.get("biz_data", {})
-        session_id = session.get("id") or session.get("chat_session_id") or ""
+        if not isinstance(session, dict):
+            session = {}
+        nested_chat_session = session.get("chat_session")
+        if not isinstance(nested_chat_session, dict):
+            nested_chat_session = {}
+        session_id = (
+            nested_chat_session.get("id")
+            or session.get("id")
+            or nested_chat_session.get("chat_session_id")
+            or session.get("chat_session_id")
+            or ""
+        )
         if not isinstance(session_id, str) or not session_id:
             raise RuntimeError("DeepSeek session creation returned no session id.")
         return session_id

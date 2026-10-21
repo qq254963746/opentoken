@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import queue
 import threading
-from time import time
+from time import monotonic, time
 from uuid import uuid4
 
 import httpx
@@ -29,10 +30,17 @@ from opentoken.api.usage import (
 )
 from opentoken.gateway.normalized import normalize_chat_completions_request
 from opentoken.gateway.router import get_default_router
+from opentoken.logging_setup import (
+    current_request_id,
+    reset_request_id,
+    set_request_id,
+)
 from opentoken.providers.base import ProviderRateLimitError
 from opentoken.providers.web_tool_calling import parse_web_tool_response
 
 router = APIRouter()
+
+logger = logging.getLogger("opentoken.api.chat")
 
 # Browser-backed providers can go silent for tens of seconds (e.g. a multi-step
 # web search runs before any answer text is emitted). With nothing on the wire,
@@ -50,8 +58,12 @@ def _iter_with_heartbeat(chunks, interval: float = _STREAM_HEARTBEAT_SECONDS):
     if no item arrives within `interval`, we surface a heartbeat and keep waiting.
     Errors raised by the upstream iterator are re-raised here, in order."""
     q: "queue.Queue[tuple[str, object]]" = queue.Queue()
+    # Threads start with an empty context, so provider log lines emitted here
+    # would lose the request id. Hoist the caller's id across the thread hop.
+    request_id = current_request_id()
 
     def _drain() -> None:
+        token = set_request_id(request_id)
         try:
             for item in chunks:
                 q.put(("item", item))
@@ -59,6 +71,8 @@ def _iter_with_heartbeat(chunks, interval: float = _STREAM_HEARTBEAT_SECONDS):
             q.put(("error", exc))
         else:
             q.put(("done", None))
+        finally:
+            reset_request_id(token)
 
     worker = threading.Thread(target=_drain, daemon=True)
     worker.start()
@@ -74,6 +88,41 @@ def _iter_with_heartbeat(chunks, interval: float = _STREAM_HEARTBEAT_SECONDS):
             raise value  # type: ignore[misc]
         else:  # done
             return
+
+
+def _run_blocking_with_heartbeat(call, interval: float = _STREAM_HEARTBEAT_SECONDS):
+    """Run a blocking `call()` on a worker thread, emitting heartbeats while it runs.
+
+    Some providers cannot stream at all — e.g. a browser adapter answering a
+    request that carries `tools` must see the whole reply before it can parse the
+    tool protocol, so `stream_chat` returns None and the route falls back to the
+    non-stream `router.chat()`. That call can block for a minute against a browser
+    provider, and with nothing on the wire clients hit their read timeout and
+    abort a request that is actually progressing. Yields ("heartbeat", None)
+    while waiting and finally ("item", result) or ("error", exc).
+    """
+    q: "queue.Queue[tuple[str, object]]" = queue.Queue()
+    request_id = current_request_id()
+
+    def _run() -> None:
+        token = set_request_id(request_id)
+        try:
+            q.put(("item", call()))
+        except Exception as exc:  # noqa: BLE001 - re-raised by the consumer
+            q.put(("error", exc))
+        finally:
+            reset_request_id(token)
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    while True:
+        try:
+            kind, value = q.get(timeout=interval)
+        except queue.Empty:
+            yield ("heartbeat", None)
+            continue
+        yield (kind, value)
+        return
 
 
 def _heartbeat_chunk(completion_id: str, created: int, model: str) -> str:
@@ -192,6 +241,7 @@ def _stream_chat_completion(
     completion_id: str,
     created: int,
 ):
+    started_monotonic = monotonic()
     role_chunk = {
         "id": completion_id,
         "object": "chat.completion.chunk",
@@ -303,14 +353,38 @@ def _stream_chat_completion(
                 }
                 yield f"data: {json.dumps(final_chunk, separators=(',', ':'))}\n\n"
                 yield "data: [DONE]\n\n"
+                logger.info(
+                    "stream_complete model=%s finish_reason=%s content_chars=%d "
+                    "tool_calls=%d elapsed_ms=%.0f",
+                    request.model,
+                    stream_finish_reason,
+                    len(projector.raw_text or ""),
+                    len(stream_tool_calls),
+                    (monotonic() - started_monotonic) * 1000.0,
+                )
                 return
             except Exception as exc:
+                logger.warning(
+                    "stream_failed model=%s error=%s detail=%s",
+                    request.model,
+                    type(exc).__name__,
+                    str(exc)[:300],
+                )
                 yield f"data: {json.dumps(_stream_error_payload(exc), separators=(',', ':'))}\n\n"
                 yield "data: [DONE]\n\n"
                 return
 
     try:
-        response = router.chat(request)
+        response = None
+        for kind, value in _run_blocking_with_heartbeat(lambda: router.chat(request)):
+            if kind == "heartbeat":
+                yield _heartbeat_chunk(completion_id, created, request.model)
+                continue
+            if kind == "error":
+                raise value  # type: ignore[misc]
+            response = value
+        if response is None:
+            raise RuntimeError("Gateway returned no chat response.")
     except Exception as exc:
         yield f"data: {json.dumps(_stream_error_payload(exc), separators=(',', ':'))}\n\n"
         yield "data: [DONE]\n\n"

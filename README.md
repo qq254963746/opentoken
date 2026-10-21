@@ -24,6 +24,8 @@ OpenToken 做的：(1) 凭证统一管理；(2) 本地 OpenAI 兼容 HTTP 接口
 
 **网页登录态 / 浏览器采集（12 个）**：DeepSeek · Qwen International · Qwen China · Kimi · Claude · Doubao · ChatGPT · Gemini · Grok · GLM International · GLM China · Xiaomi Mimo
 
+其中 **Doubao** 额外提供网页驱动的**图片生成**（Seedream）与**视频生成**（Seedance），见下文「图像生成 / 视频生成」。
+
 **API key 直连（4 个）**：
 - **Manus**（官方 API）
 - **NVIDIA NIM** — `integrate.api.nvidia.com/v1`，免费 40 RPM。覆盖 DeepSeek R1 / Llama 3.3 70B / Qwen 2.5 72B / Mixtral 8x22B 等。注册 NVIDIA 账号拿 `nvapi-...` key 就能用，0 信用卡。
@@ -66,6 +68,7 @@ Python **>= 3.13**，推荐用 [`uv`](https://docs.astral.sh/uv/)。
 ├── provider-sessions.json   # 会话上下文（conversation_id 等，capped 256 entries LRU）
 ├── responses.json           # /v1/responses 历史（TTL 7d, 1024 entries LRU）
 ├── files/, uploads/         # /v1/files & /v1/uploads 二进制内容
+├── logs/gateway.log         # 轮转日志（10 MiB × 5，字段见「日志与排查」）
 └── model-catalog-cache.json # 模型发现缓存
 ```
 
@@ -201,6 +204,26 @@ curl http://127.0.0.1:32117/v1/models -H 'Authorization: Bearer YOUR_LOCAL_GATEW
 
 `/v1/models` 只列**裸名 `<provider>/<model>`** 一种格式：`qwen-intl/qwen3.7-plus`、`deepseek/deepseek-chat`、`nim/deepseek-ai/deepseek-r1`、`unified/openrouter/anthropic/claude-3.5-sonnet`。provider 段用于消歧（`glm-cn/glm-5` 与 `glm-intl/glm-5` 区分）。模型别名**大小写不敏感**。（旧的 `algae/<provider>/<model>` 命名空间形式仍被解析器接受,向后兼容,但不再列在 `/v1/models`。）
 
+每个条目多带一个 `capability` 字段，告诉客户端该往哪个端点发：
+
+```json
+{
+  "object": "list",
+  "data": [
+    {"id": "qwen-intl/qwen3.7-plus", "object": "model", "owned_by": "opentoken", "capability": "text"},
+    {"id": "doubao/seedream-5.0-flash", "object": "model", "owned_by": "opentoken", "capability": "image"},
+    {"id": "doubao/seedance-2.0-mini", "object": "model", "owned_by": "opentoken", "capability": "video"}
+  ]
+}
+```
+
+| `capability` | 端点 |
+| --- | --- |
+| `text` | `/v1/chat/completions`、`/v1/responses` |
+| `image` | `/v1/images/generations` |
+| `video` | `/v1/videos` |
+| `audio` | 预留，暂无模型（豆包 Web skill 不支持音频） |
+
 **Chat Completions（流式）**：
 
 ```bash
@@ -250,6 +273,54 @@ curl -X POST http://127.0.0.1:32117/v1/uploads \
 - 每个 part 进来时校验"已有 parts 字节 + 本 part > 声明 bytes" → 413 拒
 - **`GET /v1/files/{id}/content` 始终回 `application/octet-stream` + `nosniff` + `attachment`**，不回显上传时声明的 mime_type，防止 stored XSS
 
+**图像生成（Doubao Seedream）**：
+
+```bash
+curl http://127.0.0.1:32117/v1/images/generations \
+  -H 'Authorization: Bearer YOUR_LOCAL_GATEWAY_KEY' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "doubao/seedream-5.0-flash",
+    "prompt": "一只戴墨镜的猫，扁平插画风格",
+    "n": 2,
+    "response_format": "url"
+  }'
+```
+
+- 走豆包网页的「图像生成」技能（Seedream），用已登录的 Camoufox 会话驱动；上游没有图片 API，所以**必须**先 `opentoken login doubao`。
+- 可选模型：`doubao/seedream-5.0-flash`（默认）· `doubao/seedream-5.0-pro` · `doubao/seedream-4.5` · `doubao/seedream-4.0`；这四款登录后才会出现在 `/v1/models`。
+- `n` 上限 **4**：网页一次只渲染一张，`n` 是串行跑多轮（每张约 20–40s），不是一次批量出图。
+- `response_format=url` 直接回签名 CDN 链接（豆包侧有效期到 2036，无需网关缓存）；`response_format=b64_json` 由网关下载后内联 base64，适合不接受外链的客户端。
+- 响应是 OpenAI 形状：`{"created", "model", "data": [{"url"|"b64_json", "revised_prompt"?}]}`。
+- 单次整体预算由 `timeout` 控制（默认 240s，上限 600s），超时回 **504**。
+
+**视频生成（Doubao Seedance）**：
+
+```bash
+# 异步（默认）：立即返回 job，稍后轮询
+curl http://127.0.0.1:32117/v1/videos/generations \
+  -H 'Authorization: Bearer YOUR_LOCAL_GATEWAY_KEY' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"doubao/seedance-2.0-mini","prompt":"一只小猫在草地上奔跑"}'
+
+curl http://127.0.0.1:32117/v1/videos/generations/vidgen-xxxx \
+  -H 'Authorization: Bearer YOUR_LOCAL_GATEWAY_KEY'
+```
+
+```bash
+# 同步：等渲染完成直接拿结果（豆包自己提示"预计等待 5 分钟"）
+curl http://127.0.0.1:32117/v1/videos/generations \
+  -H 'Authorization: Bearer YOUR_LOCAL_GATEWAY_KEY' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"doubao/seedance-2.0-mini","prompt":"一只小猫在草地上奔跑","wait":true}'
+```
+
+- 可选模型：`doubao/seedance-2.0-mini`（默认）· `doubao/seedance-2.0-fast` · `doubao/seedance-2.0` · `doubao/seedance-2.5`。
+- 完整的请求/响应字段、状态机、错误码见 **[docs/media-generation-api.md](docs/media-generation-api.md)**。
+- 异步返回 `{"id", "object":"video.generation", "status":"in_progress", "status_url", ...}`；轮询到 `status=completed` 时带 `url` / `width` / `height` / `duration_seconds`，失败时带 `error`。
+- 视频是豆包**异步**投递的：先回一条"预计等待 N 分钟"的确认，几分钟后才发视频卡片；网关会点开播放器拿 `<video src>` 里的签名 MP4 直链。`timeout` 默认 600s，上限 900s，超时同样回 **504**。
+- job 只存在网关进程内存里（TTL 1h，超过 64 条时按 TTL 清理）；网关重启后旧 job 查不到，但视频仍在豆包会话里。
+
 **`/v1/embeddings` 当前 501**：早期是 SHA-256 派生的伪向量，会污染 RAG 数据源 → 直接拒，把流量路由到真实 backend。`/v1/models` 也不再列 `text-embedding-*` 让 SDK auto-discover 别拿了再调。
 
 ## 错误分类
@@ -274,6 +345,42 @@ uv run opentoken config --opentoken-config /path/to/openclaw-config.json
 ```
 
 原子写（tmp + os.replace）+ chmod 0600（patch 含本地 apiKey）。
+
+## 日志与排查
+
+`opentoken start` 会把日志同时打到终端和轮转文件（默认 `~/.opentoken/logs/gateway.log`，10 MiB × 5 份）：
+
+```bash
+uv run opentoken start                     # 默认 INFO，写 ~/.opentoken/logs/gateway.log
+uv run opentoken start --log-level debug   # 加上浏览器 composer/点击策略等细节
+uv run opentoken start --log-file none     # 只打终端
+tail -f ~/.opentoken/logs/gateway.log
+```
+
+每行都带 `[request_id]`，和响应头 `X-Request-Id` 一致（客户端自带 `X-Request-Id` 时沿用），所以一次慢请求的完整链路可以用一个 id 串起来：
+
+```
+INFO  [3677952b…] opentoken.api: request_complete method=POST path=/v1/chat/completions status=200 elapsed_ms=7.98 streaming=true
+INFO  [3677952b…] opentoken.gateway.router: route_stream model=doubao/doubao-seed-2.0 provider=doubao adapter=BrowserChatAdapter
+INFO  [3677952b…] opentoken.providers.browser: doubao_stream_start model=doubao-seed-2.0 path=dom-first message_chars=18
+DEBUG [3677952b…] opentoken.providers.browser: doubao_composer_filled strategy=keystrokes
+DEBUG [3677952b…] opentoken.providers.browser: doubao_send_click path=js
+INFO  [3677952b…] opentoken.providers.browser: doubao_dom_first_token first_token_ms=6758
+INFO  [3677952b…] opentoken.providers.browser: doubao_dom_stream_finished emitted_chars=5 total_ms=7407
+INFO  [3677952b…] opentoken.api.chat: stream_complete finish_reason=stop content_chars=5 elapsed_ms=19466
+```
+
+注意 `request_complete` 对 SSE 只表示**响应头已发出**（`streaming=true` 时 `elapsed_ms` 不是总耗时），真正的总耗时看 `stream_complete`。关键字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `elapsed_ms` / `total_ms` | 各阶段耗时 |
+| `first_token_ms` | 首字延迟（含浏览器会话/页面准备 + 上游思考） |
+| `strategy` | 输入框填充方式；出现 `fill-fallback` 说明多行换行被压平，需要排查 |
+| `doubao_submit_missing` | 点了发送但没发出 `/chat/completion`，自动重载重试一次 |
+| `doubao_stream_path_failed` | 某条路径失败后切换到另一条（附 `detail`） |
+
+环境变量：`OPENTOKEN_LOG_LEVEL`、`OPENTOKEN_LOG_FILE`（设为 `none` 关闭文件）。
 
 ## 常见排障
 

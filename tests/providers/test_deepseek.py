@@ -165,6 +165,49 @@ def test_deepseek_web_client_retries_after_refresh_when_session_creation_is_unau
     assert seen_auth_headers == ["Bearer stale-token", "Bearer fresh-token"]
 
 
+def test_deepseek_web_client_reads_session_id_from_nested_chat_session() -> None:
+    # Upstream moved the id from `data.biz_data.id` to
+    # `data.biz_data.chat_session.id`; both must keep working.
+    credentials = ProviderCredentialRecord(
+        provider="deepseek",
+        kind="web_session",
+        cookie="session=value",
+        headers={"authorization": "Bearer token"},
+        user_agent="ua",
+        status="valid",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v0/chat_session/create":
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "msg": "",
+                    "data": {
+                        "biz_code": 0,
+                        "biz_msg": "",
+                        "biz_data": {
+                            "chat_session": {
+                                "id": "session-nested",
+                                "title": None,
+                                "seq_id": 1,
+                            },
+                            "ttl_seconds": 259200,
+                        },
+                    },
+                },
+            )
+        raise AssertionError(f"Unexpected path {request.url.path}")
+
+    client = DeepSeekWebClient(
+        credentials,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert client.create_chat_session() == "session-nested"
+
+
 def test_deepseek_web_client_solves_sha256_pow() -> None:
     credentials = ProviderCredentialRecord(
         provider="deepseek",

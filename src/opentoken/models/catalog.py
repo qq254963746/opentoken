@@ -1,17 +1,24 @@
 from dataclasses import dataclass
 
+from opentoken.models.capabilities import DEFAULT_CAPABILITY, normalize_capability
+
 
 @dataclass(frozen=True)
 class ModelCatalogEntry:
     id: str
     provider: str
     name: str
+    # What the model produces ("text" / "image" / "video" / "audio"). Chat
+    # discovery only yields text models, so the default covers every entry that
+    # doesn't say otherwise.
+    capability: str = DEFAULT_CAPABILITY
 
     def to_openai_dict(self) -> dict[str, str]:
         return {
             'id': self.id,
             'object': 'model',
             'owned_by': self.provider,
+            'capability': normalize_capability(self.capability),
         }
 
     def to_opentoken_dict(self) -> dict[str, str]:

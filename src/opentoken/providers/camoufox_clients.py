@@ -5,6 +5,7 @@ import base64
 import hashlib
 import inspect
 import json
+import logging
 import queue
 import re
 import shutil
@@ -14,6 +15,7 @@ import threading
 from contextlib import contextmanager
 from collections.abc import Iterator
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import httpx
@@ -45,6 +47,16 @@ from opentoken.providers.qwen import (
 )
 from opentoken.storage.provider_store import save_provider_credentials
 from opentoken.storage.provider_sessions import load_provider_session, save_provider_session
+
+if TYPE_CHECKING:
+    from opentoken.providers.doubao_media import MediaAsset
+
+
+logger = logging.getLogger("opentoken.providers.browser")
+
+
+def _log_elapsed_ms(started: float) -> float:
+    return (time.monotonic() - started) * 1000.0
 
 
 # Camoufox runs as a local browser, so the host OS is the browser's OS. The
@@ -118,13 +130,94 @@ _QWEN_INTL_API_STREAM_HTTP_TIMEOUT = httpx.Timeout(
     pool=20.0,
 )
 _DOUBAO_BROWSER_STREAM_STARTUP_TIMEOUT_SECONDS = 15.0
-_DOUBAO_DOM_STREAM_STARTUP_TIMEOUT_SECONDS = 15.0
-_DOUBAO_MODEL_MENU_NAME_MAP = {
-    "doubao-seed-2.0": ("快速", "快速 适用于大部分情况"),
-    "doubao-lite": ("快速", "快速 适用于大部分情况"),
-    "doubao-thinking": ("思考", "思考 擅长解决更难的问题"),
-    "doubao-pro": ("专家", "专家 新 研究级智能模型"),
+# Reasoning (专家) answers can sit silent well past 15s before the first token.
+_DOUBAO_DOM_STREAM_STARTUP_TIMEOUT_SECONDS = 30.0
+# How long the non-stream DOM path waits for Doubao to issue the
+# /chat/completion POST after clicking send. A send click that no-ops used to
+# cost the full 120s listener timeout, which clients report as a dead request.
+_DOUBAO_SEND_ACK_TIMEOUT_SECONDS = 20.0
+# Fallback "answer is done" signal when the regenerate button never shows up.
+_DOUBAO_DOM_STABLE_ROUNDS = 3
+# Doubao replaced its semi-design <textarea> composer with a TipTap/ProseMirror
+# `div[contenteditable=true]`. Keep the legacy textarea selectors last so older
+# builds (and any A/B bucket still serving them) keep working.
+_DOUBAO_COMPOSER_SELECTOR = (
+    'div[contenteditable="true"].ProseMirror, '
+    '[data-testid="chat_input_input"] div[contenteditable="true"], '
+    'textarea[placeholder^="发消息"], '
+    "textarea.semi-input-textarea"
+)
+# Send button: current builds render an icon-only <button> whose <svg> carries
+# `g-send-msg-btn-text`; the legacy build had a `g-send-msg-btn-bg` class on the
+# button itself. Prefer either marker over "last visible button in the box".
+_DOUBAO_SEND_BUTTON_CLICK_JS = """
+() => {
+  const visible = (node) => !!node && !!node.offsetParent;
+  const candidates = Array.from(
+    document.querySelectorAll('#input-engine-container button, button')
+  ).filter((node) => {
+    if (!visible(node)) {
+      return false;
+    }
+    if (node.disabled || node.getAttribute('aria-disabled') === 'true') {
+      return false;
+    }
+    return true;
+  });
+  const preferred = candidates.find((node) =>
+    String(node.className || '').includes('g-send-msg-btn-bg')
+  ) || candidates.find((node) =>
+    !!node.querySelector && !!node.querySelector('svg[class*="g-send-msg-btn-text"]')
+  ) || candidates.at(-1);
+  if (!preferred) {
+    return false;
+  }
+  preferred.click();
+  return true;
 }
+"""
+_DOUBAO_ALL_MODEL_MENU_LABELS = ("快速", "思考", "专家")
+_DOUBAO_MODEL_MENU_NAME_MAP = {
+    # Current picker labels are prefixed ("豆包 快速" / "豆包 专家"); matching is
+    # prefix-based, so the bare mode word is the right key. "思考" is no longer
+    # a separate menu entry — 专家 absorbed deep thinking.
+    "doubao-seed-2.0": ("快速",),
+    "doubao-lite": ("快速",),
+    "doubao-thinking": ("专家",),
+    "doubao-pro": ("专家",),
+}
+# Answer scraping for the DOM stream path: the assistant turn is
+# `[data-testid="receive_message"]` and its rendered blocks carry
+# `[data-testid="message_text_content"]`. `message_action_regenerate` only
+# mounts once Doubao finishes the answer, which is our "done" signal.
+_DOUBAO_DOM_ANSWER_POLL_JS = """
+({ beforeTurnCount }) => {
+  const clean = (text) => (text || "")
+    .replace(/[\\u200B-\\u200D\\uFEFF]/g, " ")
+    .replace(/\\s+/g, " ")
+    .trim();
+  const isVisible = (node) => !!node && !!node.offsetParent;
+  const turns = Array.from(document.querySelectorAll('[data-testid="receive_message"]'))
+    .filter(isVisible);
+  const answerTexts = [];
+  for (const turn of turns.slice(beforeTurnCount)) {
+    for (const node of turn.querySelectorAll('[data-testid="message_text_content"]')) {
+      if (!isVisible(node)) {
+        continue;
+      }
+      const text = clean(node.innerText || node.textContent || "");
+      if (text) {
+        answerTexts.push(text);
+      }
+    }
+  }
+  const lastTurn = turns.length ? turns[turns.length - 1] : null;
+  const generationDone = Boolean(
+    lastTurn && lastTurn.querySelector('[data-testid="message_action_regenerate"]')
+  );
+  return { answerTexts, generationDone };
+}
+"""
 _GLM_CN_AUTH_COOKIE_NAMES = frozenset(
     {
         "chatglm_token",
@@ -205,6 +298,120 @@ class CamoufoxProviderClient:
         if handler is None:
             return self.chat_completion(message=message, model=model)
         return handler(message=message, model=model)
+
+    @contextmanager
+    def _doubao_media_page(self):
+        """Yield a live Doubao page for a media (image/video) run.
+
+        Mirrors the chat path's session handling (cookie injection, closed-page
+        replacement, URL check) but keeps the browser out of the chat-specific
+        conversation bookkeeping. A failure tears the session down so the next
+        call starts from a clean profile, exactly like `_chat_doubao`.
+        """
+        with _provider_session_lock(self._provider):
+            session = _get_or_create_browser_session(
+                provider=self._provider,
+                state_dir=self._state_dir,
+                headless=self._headless,
+            )
+            context = session.context
+            page = session.page
+            page_was_replaced = False
+            try:
+                self._inject_cookie_string(context, (".doubao.com", "www.doubao.com"))
+                if _page_is_closed(page):
+                    page = (
+                        context.pages[0]
+                        if getattr(context, "pages", [])
+                        else context.new_page()
+                    )
+                    session.page = page
+                    page_was_replaced = True
+                current_url = str(getattr(page, "url", ""))
+                if "doubao.com/chat" not in current_url:
+                    page.goto(_DOUBAO_URL, wait_until="domcontentloaded", timeout=120000)
+                    page.wait_for_timeout(4000)
+                yield session, page
+            except Exception:
+                if not page_was_replaced:
+                    _close_browser_session(self._provider)
+                raise
+
+    def _reset_doubao_composer(self, page) -> None:
+        """Leave media mode so a later chat request isn't typed into it.
+
+        After 图像生成 / 视频生成 the composer stays in that skill until the user
+        dismisses it, and the skill chip's close button is not addressable by a
+        stable selector. Reloading the chat page resets the composer to 对话 and
+        is cheap next to the render that just finished.
+        """
+        try:
+            page.goto(_DOUBAO_URL, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(1500)
+        except Exception:
+            pass
+
+    def generate_images(
+        self,
+        *,
+        message: str,
+        model: str,
+        count: int = 1,
+        timeout_seconds: float = 240.0,
+    ) -> list["MediaAsset"]:
+        from opentoken.models.media import IMAGE, MediaModel, resolve_media_model
+        from opentoken.providers import doubao_media
+
+        if self._provider != "doubao":
+            raise RuntimeError(f"Image generation is not supported for {self._provider}.")
+        resolved: MediaModel | None = resolve_media_model(model, kind=IMAGE)
+        if resolved is None:
+            raise RuntimeError(f"Unknown image model: {model}")
+
+        with self._doubao_media_page() as (_session, page):
+            try:
+                return doubao_media.generate_doubao_images(
+                    page,
+                    prompt=message,
+                    model=resolved,
+                    count=max(1, int(count)),
+                    timeout_seconds=timeout_seconds,
+                )
+            finally:
+                self._reset_doubao_composer(page)
+
+    def generate_video(
+        self,
+        *,
+        message: str,
+        model: str,
+        timeout_seconds: float = 600.0,
+        seconds: int | None = None,
+        size: str | None = None,
+        reference_images: list[Path] | tuple[Path, ...] = (),
+    ) -> "MediaAsset":
+        from opentoken.models.media import VIDEO, MediaModel, resolve_media_model
+        from opentoken.providers import doubao_media
+
+        if self._provider != "doubao":
+            raise RuntimeError(f"Video generation is not supported for {self._provider}.")
+        resolved: MediaModel | None = resolve_media_model(model, kind=VIDEO)
+        if resolved is None:
+            raise RuntimeError(f"Unknown video model: {model}")
+
+        with self._doubao_media_page() as (_session, page):
+            try:
+                return doubao_media.generate_doubao_video(
+                    page,
+                    prompt=message,
+                    model=resolved,
+                    timeout_seconds=timeout_seconds,
+                    seconds=seconds,
+                    size=size,
+                    reference_images=reference_images,
+                )
+            finally:
+                self._reset_doubao_composer(page)
 
     def _with_page(self, *, start_url: str, cookie_domains: tuple[str, ...], action):
         with _provider_session_lock(self._provider):
@@ -557,25 +764,18 @@ class CamoufoxProviderClient:
                 if isolated_tool_context:
                     self._suppress_doubao_conversation_persist = True
                 session.metadata["doubao_request_params"] = resolve_doubao_query_params(self._credentials)
+                _select_doubao_model(page, model)
+                # DOM compose+send runs FIRST. The programmatic in-page fetch
+                # (/chat/completion via session.metadata["doubao_request_params"])
+                # only carries the unsigned static query params and now trips
+                # Doubao's anti-bot wall (710022004 + a sliding `verify`
+                # challenge, verify_scene=doubao_message_web); the page's own
+                # composer request is signed with fresh msToken/a_bogus and
+                # gets through. Keep the fetch as a fallback for when the UI
+                # markup drifts, not as the fast path.
+                dom_error: Exception | None = None
+                chat_started = time.monotonic()
                 try:
-                    _select_doubao_model(page, model)
-                    return _call_with_supported_kwargs(
-                        _fetch_doubao_browser_completion,
-                        page,
-                        session=session,
-                        client=self,
-                        message=message,
-                        model=model,
-                    )
-                except (ProviderRateLimitError, RuntimeError):
-                    # The programmatic in-page API fetch (/samantha/chat/completion)
-                    # is what Doubao's anti-bot rate-limits (710022004 + a `verify`
-                    # challenge). The human-like DOM path — type into the composer
-                    # and click send — issues the page's OWN properly-signed
-                    # request and gets through. (Verified: API fetch → 429 while
-                    # DOM compose+send returns a real answer.) So the API fetch is
-                    # just a fast-path optimization; on ANY failure (rate-limit or
-                    # API-shape drift) fall back to the DOM path.
                     return _call_with_supported_kwargs(
                         _dom_send_and_wait_doubao,
                         page,
@@ -584,6 +784,27 @@ class CamoufoxProviderClient:
                         message=message,
                         model=model,
                     )
+                except Exception as exc:
+                    dom_error = exc
+                    logger.warning(
+                        "doubao_dom_chat_failed model=%s elapsed_ms=%.0f error=%s detail=%s",
+                        model,
+                        _log_elapsed_ms(chat_started),
+                        type(exc).__name__,
+                        str(exc)[:300],
+                    )
+                try:
+                    logger.info("doubao_fetch_fallback model=%s", model)
+                    return _call_with_supported_kwargs(
+                        _fetch_doubao_browser_completion,
+                        page,
+                        session=session,
+                        client=self,
+                        message=message,
+                        model=model,
+                    )
+                except Exception as api_error:
+                    raise dom_error or api_error
             except ProviderRateLimitError:
                 raise
             except Exception:
@@ -627,6 +848,12 @@ class CamoufoxProviderClient:
                     session.metadata["doubao_request_params"] = resolve_doubao_query_params(self._credentials)
                     _select_doubao_model(page, model)
                     prefer_dom_first = _prefer_dom_first_doubao_stream(model)
+                    logger.info(
+                        "doubao_stream_start model=%s path=%s message_chars=%d",
+                        model,
+                        "dom-first" if prefer_dom_first else "fetch-first",
+                        len(message),
+                    )
 
                     def _yield_stream(stream_factory) -> tuple[bool, Exception | None]:
                         emitted_any = False
@@ -647,6 +874,11 @@ class CamoufoxProviderClient:
                             # the API attempt must fall through to DOM, not abort.
                             if emitted_any:
                                 raise
+                            logger.warning(
+                                "doubao_stream_path_failed error=%s detail=%s",
+                                type(exc).__name__,
+                                str(exc)[:300],
+                            )
                             return emitted_any, exc
                         return emitted_any, None
 
@@ -1857,7 +2089,12 @@ def _page_is_closed(page) -> bool:
 
 def _prefer_dom_first_doubao_stream(model: str) -> bool:
     _ = str(model or "").strip().lower()
-    return False
+    # Always compose+send through the page UI first: the in-page fetch path
+    # (/chat/completion with unsigned static query params) is behind Doubao's
+    # anti-bot `verify` challenge (710022004), so trying it first only adds
+    # latency and another throttled request. The DOM path issues the page's own
+    # signed request. Set this back to False only if the fetch becomes usable.
+    return True
 
 
 def _stop_doubao_dom_generation(page) -> None:
@@ -2207,14 +2444,26 @@ def _extract_qwen_cn_candidate_text(
 def _extract_doubao_dom_candidate_text(
     prompt: str,
     *,
-    markdown_texts: list[str],
-    message_texts: list[str],
+    answer_texts: list[str],
 ) -> str:
-    return _extract_qwen_cn_candidate_text(
-        prompt,
-        markdown_texts=markdown_texts,
-        message_texts=message_texts,
-    )
+    """Join the rendered answer blocks of the newest Doubao reply.
+
+    Doubao's assistant turn is `[data-testid="receive_message"]` and each of its
+    rendered blocks carries `[data-testid="message_text_content"]`. Scraping
+    that instead of the generic `[class*="markdown"] / [class*="message"]` nodes
+    keeps the timestamp chip ("今天 17:35" lives in the action bar) and the
+    follow-up suggestion chips (`suggest_message_list`) out of the answer.
+    """
+    prompt_text = _clean_dom_text(prompt)
+    parts: list[str] = []
+    for raw in answer_texts:
+        text = _clean_dom_text(raw)
+        if not text:
+            continue
+        if prompt_text and text == prompt_text:
+            continue
+        parts.append(text)
+    return "\n".join(parts).strip()
 
 
 def _advance_text_stream_state(current: str, candidate: str) -> tuple[str, str]:
@@ -2341,6 +2590,24 @@ def _set_visible_textarea_value(page, selectors: list[str], value: str) -> bool:
                       continue;
                     }
                     candidate.focus();
+                    if (candidate.isContentEditable) {
+                      // TipTap/ProseMirror composers ignore direct textContent
+                      // writes; go through the editing pipeline so the editor
+                      // state (and the send-button enablement) updates.
+                      const selection = window.getSelection();
+                      const range = document.createRange();
+                      range.selectNodeContents(candidate);
+                      selection.removeAllRanges();
+                      selection.addRange(range);
+                      const inserted = document.execCommand("insertText", false, value);
+                      if (!inserted) {
+                        candidate.textContent = value;
+                        candidate.dispatchEvent(
+                          new InputEvent("input", { bubbles: true, data: value, inputType: "insertText" })
+                        );
+                      }
+                      return true;
+                    }
                     candidate.value = value;
                     candidate.dispatchEvent(new Event("input", { bubbles: true }));
                     candidate.dispatchEvent(new Event("change", { bubbles: true }));
@@ -2372,62 +2639,344 @@ def _is_glm_retryable_dom_error(error_detail: str) -> bool:
     )
 
 
-def _dom_send_and_wait_doubao(page, session: _ProviderBrowserSession, client: CamoufoxProviderClient, message: str, model: str) -> str:
-    for attempt in range(2):
-        _select_doubao_model(page, model)
+_DOUBAO_COMPOSER_FALLBACK_SELECTORS = [
+    'div[contenteditable="true"].ProseMirror',
+    '[data-testid="chat_input_input"] div[contenteditable="true"]',
+    'textarea[placeholder^="发消息"]',
+    "textarea.semi-input-textarea",
+    "textarea",
+]
+_DOUBAO_SEND_BUTTON_SELECTOR = 'button[class*="g-send-msg-btn-bg"], #input-engine-container button'
 
-        composer = page.locator(
-            'textarea[placeholder="发消息..."], textarea.semi-input-textarea'
-        ).first
-        composer.wait_for(timeout=120000)
-        composer_focused = False
+_DOUBAO_COMPOSER_TEXT_JS = """
+() => {
+  const node = document.querySelector(
+    'div[contenteditable="true"].ProseMirror, ' +
+    '[data-testid="chat_input_input"] div[contenteditable="true"], ' +
+    'textarea[placeholder^="发消息"], textarea.semi-input-textarea'
+  );
+  if (!node) return '';
+  return node.innerText || node.value || '';
+}
+"""
+
+
+def _doubao_composer_text(page) -> str:
+    try:
+        return str(page.evaluate(_DOUBAO_COMPOSER_TEXT_JS) or "")
+    except Exception:
+        return ""
+
+
+_DOUBAO_INSERT_HTML_JS = """
+({ html }) => {
+  const node = document.querySelector(
+    'div[contenteditable="true"].ProseMirror, ' +
+    '[data-testid="chat_input_input"] div[contenteditable="true"], ' +
+    'textarea[placeholder^="发消息"], textarea.semi-input-textarea'
+  );
+  if (!node) {
+    return 'no-composer';
+  }
+  if (node.tagName === 'TEXTAREA' || typeof node.value === 'string') {
+    // A textarea preserves newlines natively; the caller uses fill() for it.
+    return 'textarea';
+  }
+  try {
+    node.focus();
+  } catch (_error) {}
+  const selection = window.getSelection();
+  if (!selection) {
+    return 'no-selection';
+  }
+  const range = document.createRange();
+  range.selectNodeContents(node);
+  selection.removeAllRanges();
+  selection.addRange(range);
+  let inserted = false;
+  try {
+    inserted = document.execCommand('insertHTML', false, html);
+  } catch (_error) {
+    inserted = false;
+  }
+  if (!inserted) {
+    // Second chance: write the DOM directly and let ProseMirror's observer
+    // reconcile it (verified by the caller before anything is sent).
+    try {
+      node.innerHTML = html;
+      node.dispatchEvent(
+        new InputEvent('input', { bubbles: true, inputType: 'insertFromPaste' })
+      );
+      inserted = true;
+    } catch (_error) {
+      return 'failed';
+    }
+  }
+  return inserted ? 'ok' : 'failed';
+}
+"""
+
+
+def _doubao_message_to_paragraph_html(message: str) -> str:
+    """Render the message as one `<p>` per line so the editor keeps line breaks.
+
+    A single text blob is not enough: `locator.fill()` and `keyboard.insert_text`
+    both collapse `\\n` into a space on the TipTap/ProseMirror composer. Feeding
+    paragraph HTML lets ProseMirror's own paste handler build the document (and
+    therefore the `/chat/completion` body) with the caller's newlines intact.
+    """
+    normalized = message.replace("\r\n", "\n").replace("\r", "\n")
+
+    def escape(value: str) -> str:
+        # & first, or the escapes we add below would be double-escaped.
+        return (
+            value.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\u00a0", "&nbsp;")
+        )
+
+    return "".join(f"<p>{escape(line)}</p>" for line in normalized.split("\n"))
+
+
+def _doubao_insert_message_html(page, message: str) -> bool:
+    """Put `message` in the composer in ONE round trip, line breaks preserved.
+
+    Typing line-by-line cost ~30ms of Playwright round trips per line, so an
+    88728-char prompt (the size a coding agent sends) blocked for 164s before the
+    message was even submitted — the request looked dead. This is measured at
+    0.08s for 26k chars / 408 lines with byte-identical text on the wire.
+    """
+    try:
+        result = page.evaluate(
+            _DOUBAO_INSERT_HTML_JS,
+            {"html": _doubao_message_to_paragraph_html(message)},
+        )
+    except Exception:
+        return False
+    return str(result) == "ok"
+
+
+def _doubao_normalize_for_compare(value: str) -> str:
+    return " ".join(str(value or "").split())
+
+
+def _doubao_composer_holds(page, message: str) -> bool:
+    """True when the composer text equals `message` modulo whitespace runs."""
+    typed = _doubao_composer_text(page)
+    if not typed.strip():
+        return False
+    expected = _doubao_normalize_for_compare(message)
+    actual = _doubao_normalize_for_compare(typed)
+    if not expected:
+        return False
+    # innerText renders a blank paragraph as an extra newline, which whitespace
+    # folding absorbs; the comparison is only about content, not layout.
+    return actual == expected
+
+
+def _doubao_type_multiline_composer(page, message: str) -> bool:
+    """Fallback: type a multi-line message with real paragraph breaks.
+
+    `locator.fill()` on Doubao's TipTap/ProseMirror composer collapses every
+    newline into a space (measured: `<p>a\n\nb</p>` becomes `<p>a  b</p>`), which
+    both changes the prompt and — because the request body no longer contains the
+    text the caller sent — makes the `/chat/completion` response matcher reject
+    the very response it is waiting for (a 120s stall that ends in "listener
+    timed out"). Type instead, using Shift+Enter for hard breaks: Enter alone
+    would submit the message.
+
+    Only used when the one-shot HTML path is unavailable: this is ~30ms per line
+    of Playwright overhead, which is prohibitive for agent-sized prompts.
+    """
+    lines = message.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    filler = [line for line in lines if line.strip()]
+    if not filler:
+        return False
+
+    def fill_with(emit_line) -> None:
+        page.keyboard.press(_SELECT_ALL_CHORD)
+        page.keyboard.press("Backspace")
+        page.wait_for_timeout(150)
+        for index, line in enumerate(lines):
+            if index:
+                page.keyboard.press("Shift+Enter")
+            if line:
+                emit_line(line)
+
+    # insert_text is one event per line, which keeps long tool-protocol prompts
+    # fast; some builds drop it silently, so verify and redo with real keys.
+    try:
+        fill_with(lambda line: page.keyboard.insert_text(line))
+    except Exception:
+        pass
+    page.wait_for_timeout(400)
+    if _doubao_composer_holds(page, message):
+        return True
+
+    try:
+        fill_with(lambda line: page.keyboard.type(line, delay=10))
+    except Exception:
+        return False
+    page.wait_for_timeout(400)
+    return _doubao_composer_holds(page, message)
+
+
+def _doubao_fill_composer(page, message: str) -> None:
+    """Put `message` in Doubao's composer, whatever flavour it currently is.
+
+    Strategy ladder, cheapest first:
+      1. `html-insert` — one round trip, paragraphs preserved (the normal path);
+      2. `text-keystrokes` / `multiline-keystrokes` — real key events, which are
+         the only thing some builds listen to, but cost ~30ms *per line*;
+      3. `fill-fallback` / `synthetic-input-event` — last resort; flattens
+         newlines, so it is logged as a warning.
+    The selected strategy is logged with timing because composer input, not model
+    latency, is what made large-prompt requests look hung.
+    """
+    started = time.monotonic()
+    composer = page.locator(_DOUBAO_COMPOSER_SELECTOR).first
+    composer.wait_for(timeout=120000)
+    composer_focused = False
+    try:
+        composer.click(timeout=5000, force=True)
+        composer_focused = True
+    except TypeError:
         try:
-            composer.click(timeout=5000, force=True)
+            composer.click(timeout=5000)
             composer_focused = True
-        except TypeError:
-            try:
-                composer.click(timeout=5000)
-                composer_focused = True
-            except Exception:
-                composer_focused = False
         except Exception:
             composer_focused = False
-        page.wait_for_timeout(250)
+    except Exception:
+        composer_focused = False
+    page.wait_for_timeout(250)
 
-        typed = False
-        prefer_fill = "\n" in message or "\r" in message
-        if composer_focused and not prefer_fill:
+    typed = False
+    strategy = "html-insert"
+    is_multiline = "\n" in message or "\r" in message
+    if composer_focused:
+        # Fast path first, whatever the size: it preserves line breaks exactly and
+        # turns an O(lines) number of Playwright round trips into one.
+        try:
+            typed = _doubao_insert_message_html(page, message)
+        except Exception:
+            typed = False
+        if typed:
+            page.wait_for_timeout(120)
+            typed = _doubao_composer_holds(page, message)
+            if not typed:
+                logger.warning(
+                    "doubao_html_insert_mismatch message_chars=%d", len(message)
+                )
+        if not typed and is_multiline:
+            strategy = "multiline-keystrokes"
+            try:
+                typed = _doubao_type_multiline_composer(page, message)
+            except Exception:
+                typed = False
+        elif not typed:
+            strategy = "text-keystrokes"
             try:
                 page.keyboard.press(_SELECT_ALL_CHORD)
                 page.keyboard.press("Backspace")
                 page.wait_for_timeout(150)
-                page.keyboard.type(message, delay=55)
+                # insert_text is a single event for the whole message.
+                page.keyboard.insert_text(message)
                 typed = True
             except Exception:
                 typed = False
-        if not typed:
-            try:
-                composer.fill(message)
-            except Exception:
-                _set_visible_textarea_value(
-                    page,
-                    [
-                        'textarea[placeholder="发消息..."]',
-                        "textarea.semi-input-textarea",
-                        "textarea",
-                    ],
-                    message,
-                )
-        page.wait_for_timeout(500)
-
-        send_button = None
+    if not typed:
+        # fill() flattens newlines into spaces on the TipTap editor, changing the
+        # prompt, so make the degradation visible in the log instead of silently
+        # shipping it.
+        strategy = "fill-fallback"
+        logger.warning(
+            "doubao_composer_fallback message_chars=%d multiline=%s focused=%s",
+            len(message),
+            is_multiline,
+            composer_focused,
+        )
         try:
-            send_button = page.locator(
-                'button[class*="g-send-msg-btn-bg"], #input-engine-container button'
-            ).first
-            send_button.wait_for(timeout=30000)
+            composer.fill(message)
         except Exception:
-            send_button = None
+            strategy = "synthetic-input-event"
+            _set_visible_textarea_value(page, _DOUBAO_COMPOSER_FALLBACK_SELECTORS, message)
+    page.wait_for_timeout(300)
+    logger.info(
+        "doubao_composer_filled strategy=%s message_chars=%d lines=%d elapsed_ms=%.0f",
+        strategy,
+        len(message),
+        message.count("\n") + 1,
+        _log_elapsed_ms(started),
+    )
+
+
+def _doubao_click_send_button(page) -> None:
+    """Click Doubao's send button, falling back to Enter.
+
+    The button is icon-only in current builds, so locate it by the classes its
+    <svg>/<button> carry rather than by text.
+    """
+    try:
+        if bool(page.evaluate(_DOUBAO_SEND_BUTTON_CLICK_JS)):
+            logger.debug("doubao_send_click path=js")
+            return
+    except Exception as exc:
+        logger.debug("doubao_send_click js_failed error=%s", exc)
+    try:
+        page.locator(_DOUBAO_SEND_BUTTON_SELECTOR).first.click(timeout=5000)
+        logger.debug("doubao_send_click path=locator")
+        return
+    except Exception as exc:
+        logger.debug("doubao_send_click locator_failed error=%s", exc)
+    logger.debug("doubao_send_click path=enter-key")
+    page.keyboard.press("Enter")
+
+
+class _DoubaoSubmitError(RuntimeError):
+    """The composer never submitted: no /chat/completion POST followed the click.
+
+    Distinct from a provider failure because it is retried once (a no-op click on
+    a stale editor is transient) rather than reported to the caller.
+    """
+
+
+def _doubao_attach_send_probe(page):
+    """Watch for the `/chat/completion` POST the composer should emit.
+
+    Returns `(seen, detach)` where `seen()` reports whether Doubao actually
+    issued the request. Without this, a send click that silently no-ops (stale
+    editor state, an overlay swallowing the click) is indistinguishable from a
+    very slow answer, and the caller blocks for the full listener timeout.
+    """
+    state = {"seen": False}
+
+    def handle_request(request) -> None:
+        if state["seen"]:
+            return
+        try:
+            if "chat/completion" not in str(getattr(request, "url", "")):
+                return
+            if str(getattr(request, "method", "")).upper() != "POST":
+                return
+        except Exception:
+            return
+        state["seen"] = True
+
+    page.on("request", handle_request)
+
+    def detach() -> None:
+        _detach_page_listener(page, "request", handle_request)
+
+    return (lambda: state["seen"]), detach
+
+
+def _dom_send_and_wait_doubao(page, session: _ProviderBrowserSession, client: CamoufoxProviderClient, message: str, model: str) -> str:
+    started = time.monotonic()
+    for attempt in range(2):
+        _select_doubao_model(page, model)
+
+        _doubao_fill_composer(page, message)
 
         captured_response = None
 
@@ -2448,54 +2997,47 @@ def _dom_send_and_wait_doubao(page, session: _ProviderBrowserSession, client: Ca
             captured_response = response
 
         page.on("response", handle_response)
+        request_seen, detach_request_probe = _doubao_attach_send_probe(page)
         try:
-            try:
-                clicked = bool(
-                    page.evaluate(
-                        """
-                        () => {
-                          const visible = (node) => !!node && !!node.offsetParent;
-                          const candidates = Array.from(
-                            document.querySelectorAll('#input-engine-container button, button')
-                          ).filter((node) => {
-                            if (!visible(node)) {
-                              return false;
-                            }
-                            if (node.disabled || node.getAttribute('aria-disabled') === 'true') {
-                              return false;
-                            }
-                            return true;
-                          });
-                          const preferred = candidates.find((node) =>
-                            String(node.className || '').includes('g-send-msg-btn-bg')
-                          ) || candidates.at(-1);
-                          if (!preferred) {
-                            return false;
-                          }
-                          preferred.click();
-                          return true;
-                        }
-                        """
-                    )
-                )
-                if not clicked:
-                    raise RuntimeError("Doubao send button not found")
-            except Exception:
-                try:
-                    if send_button is None:
-                        raise RuntimeError("send button locator unavailable")
-                    send_button.click(timeout=5000)
-                except Exception:
-                    page.keyboard.press("Enter")
+            _doubao_click_send_button(page)
 
             deadline = time.monotonic() + 120
+            submit_deadline = time.monotonic() + _DOUBAO_SEND_ACK_TIMEOUT_SECONDS
             while time.monotonic() < deadline:
                 if captured_response is not None:
                     break
+                if not request_seen() and time.monotonic() >= submit_deadline:
+                    raise _DoubaoSubmitError(
+                        "Doubao composer did not submit the message: no "
+                        "/chat/completion request was issued after clicking send."
+                    )
                 page.wait_for_timeout(250)
             if captured_response is None:
                 raise RuntimeError("Doubao response listener timed out waiting for chat/completion.")
+            logger.info(
+                "doubao_answer_received model=%s elapsed_ms=%.0f attempt=%d",
+                model,
+                _log_elapsed_ms(started),
+                attempt,
+            )
+        except _DoubaoSubmitError:
+            logger.warning(
+                "doubao_submit_missing model=%s elapsed_ms=%.0f attempt=%d",
+                model,
+                _log_elapsed_ms(started),
+                attempt,
+            )
+            # A click that lands on a stale editor state is transient; reload for
+            # a clean composer and retry once before giving up (the in-page fetch
+            # fallback is behind Doubao's anti-bot wall, so it is not a useful
+            # second chance).
+            if attempt == 0:
+                page.goto(_DOUBAO_URL, wait_until="domcontentloaded", timeout=120000)
+                page.wait_for_timeout(4000)
+                continue
+            raise
         finally:
+            detach_request_probe()
             _detach_page_listener(page, "response", handle_response)
 
         response = captured_response
@@ -2941,70 +3483,21 @@ def _stream_doubao_dom_completion(
     timeout_seconds: float = 120.0,
     startup_timeout_seconds: float | None = None,
 ) -> Iterator[str]:
+    started = time.monotonic()
+    first_piece_ms: float | None = None
     _select_doubao_model(page, model)
+    model_select_ms = _log_elapsed_ms(started)
     baseline = page.evaluate(
         """
         () => ({
-          markdownCount: document.querySelectorAll('[class*="markdown"]').length,
-          messageCount: document.querySelectorAll('[class*="message"]').length,
+          receiveTurnCount: document.querySelectorAll('[data-testid="receive_message"]').length,
         })
         """
     )
-    before_markdown_count = int(baseline.get("markdownCount", 0))
-    before_message_count = int(baseline.get("messageCount", 0))
+    before_turn_count = int(baseline.get("receiveTurnCount", 0))
 
-    composer = page.locator(
-        'textarea[placeholder="发消息..."], textarea.semi-input-textarea'
-    ).first
-    composer.wait_for(timeout=120000)
-    composer_focused = False
-    try:
-        composer.click(timeout=5000, force=True)
-        composer_focused = True
-    except TypeError:
-        try:
-            composer.click(timeout=5000)
-            composer_focused = True
-        except Exception:
-            composer_focused = False
-    except Exception:
-        composer_focused = False
-    page.wait_for_timeout(250)
-
-    typed = False
-    prefer_fill = "\n" in message or "\r" in message
-    if composer_focused and not prefer_fill:
-        try:
-            page.keyboard.press(_SELECT_ALL_CHORD)
-            page.keyboard.press("Backspace")
-            page.wait_for_timeout(150)
-            page.keyboard.type(message, delay=55)
-            typed = True
-        except Exception:
-            typed = False
-    if not typed:
-        try:
-            composer.fill(message)
-        except Exception:
-            _set_visible_textarea_value(
-                page,
-                [
-                    'textarea[placeholder="发消息..."]',
-                    "textarea.semi-input-textarea",
-                    "textarea",
-                ],
-                message,
-            )
-    page.wait_for_timeout(500)
-
-    send_button = None
-    try:
-        send_button = page.locator(
-            'button[class*="g-send-msg-btn-bg"], #input-engine-container button'
-        ).first
-        send_button.wait_for(timeout=30000)
-    except Exception:
-        send_button = None
+    _doubao_fill_composer(page, message)
+    prepared_ms = _log_elapsed_ms(started)
 
     captured_response = None
 
@@ -3035,91 +3528,45 @@ def _stream_doubao_dom_completion(
         else None
     )
     try:
-        try:
-            clicked = bool(
-                page.evaluate(
-                    """
-                    () => {
-                      const visible = (node) => !!node && !!node.offsetParent;
-                      const candidates = Array.from(
-                        document.querySelectorAll('#input-engine-container button, button')
-                      ).filter((node) => {
-                        if (!visible(node)) {
-                          return false;
-                        }
-                        if (node.disabled || node.getAttribute('aria-disabled') === 'true') {
-                          return false;
-                        }
-                        return true;
-                      });
-                      const preferred = candidates.find((node) =>
-                        String(node.className || '').includes('g-send-msg-btn-bg')
-                      ) || candidates.at(-1);
-                      if (!preferred) {
-                        return false;
-                      }
-                      preferred.click();
-                      return true;
-                    }
-                    """
-                )
-            )
-            if not clicked:
-                raise RuntimeError("Doubao send button not found")
-        except Exception:
-            try:
-                if send_button is None:
-                    raise RuntimeError("send button locator unavailable")
-                send_button.click(timeout=5000)
-            except Exception:
-                page.keyboard.press("Enter")
+        _doubao_click_send_button(page)
 
         while time.monotonic() < deadline:
-            result = page.evaluate(
-                """
-                ({ beforeMarkdownCount, beforeMessageCount }) => {
-                  const clean = (text) => (text || "").replace(/[\\u200B-\\u200D\\uFEFF]/g, " ").replace(/\\s+/g, " ").trim();
-                  const isVisible = (node) => !!node && !!node.offsetParent;
-                  const markdownTexts = Array.from(document.querySelectorAll('[class*="markdown"]'))
-                    .slice(beforeMarkdownCount)
-                    .filter(isVisible)
-                    .map((node) => clean(node.innerText || node.textContent || ""))
-                    .filter(Boolean);
-                  const messageTexts = Array.from(document.querySelectorAll('[class*="message"]'))
-                    .slice(beforeMessageCount)
-                    .filter(isVisible)
-                    .map((node) => clean(node.innerText || node.textContent || ""))
-                    .filter(Boolean);
-                  const composerBusy = Boolean(
-                    document.querySelector(
-                      '[aria-busy="true"], [class*="loading"], [class*="typing"], [class*="stream"], [class*="generat"], [class*="stop"]'
-                    )
-                  );
-                  return { markdownTexts, messageTexts, composerBusy };
-                }
-                """,
-                {
-                    "beforeMarkdownCount": before_markdown_count,
-                    "beforeMessageCount": before_message_count,
-                },
-            )
+            result = page.evaluate(_DOUBAO_DOM_ANSWER_POLL_JS, {"beforeTurnCount": before_turn_count})
             text = _extract_doubao_dom_candidate_text(
                 message,
-                markdown_texts=list(result.get("markdownTexts", [])),
-                message_texts=list(result.get("messageTexts", [])),
+                answer_texts=list(result.get("answerTexts", [])),
             )
+            generation_done = bool(result.get("generationDone"))
             if text and text == last_text:
                 stable_rounds += 1
             elif text:
                 last_text = text
                 stable_rounds = 0
-            if text:
+            if text or captured_response is not None:
+                # Seeing the /chat/completion response proves Doubao accepted the
+                # message and is generating; the startup budget only guards
+                # against "the composer never submitted". Clearing it here stops
+                # a slow first token (long thinking / web search) from aborting
+                # into the fetch fallback, which would post the SAME prompt a
+                # second time and leave two copies in the conversation.
                 if startup_deadline is not None:
                     startup_deadline = None
+            if text:
                 suffix, emitted = _advance_snapshot_stream_state(emitted, text)
                 if suffix:
+                    if first_piece_ms is None:
+                        first_piece_ms = _log_elapsed_ms(started)
+                        logger.info(
+                            "doubao_dom_first_token model=%s first_token_ms=%.0f "
+                            "model_select_ms=%.0f prepared_ms=%.0f upstream_ms=%.0f",
+                            model,
+                            first_piece_ms,
+                            model_select_ms,
+                            prepared_ms,
+                            first_piece_ms - prepared_ms,
+                        )
                     yield suffix
-            if not text and captured_response is not None and not result.get("composerBusy"):
+            if not text and captured_response is not None and generation_done:
                 payload = captured_response.text()
                 if payload:
                     conversation_id = _extract_doubao_conversation_id(payload)
@@ -3139,19 +3586,42 @@ def _stream_doubao_dom_completion(
                     error_detail = _extract_doubao_stream_error(payload)
                     if error_detail:
                         raise RuntimeError(f"Doubao DOM stream failed: {error_detail}")
-            if last_text and captured_response is not None and not result.get("composerBusy") and stable_rounds >= 1:
-                break
+            if last_text and captured_response is not None:
+                # `message_action_regenerate` only mounts once Doubao finishes
+                # the answer; the stable-rounds cap is the fallback for when that
+                # marker drifts, so a slow mid-answer pause never looks "done".
+                if generation_done or stable_rounds >= _DOUBAO_DOM_STABLE_ROUNDS:
+                    break
             if startup_deadline is not None and time.monotonic() >= startup_deadline:
+                logger.warning(
+                    "doubao_dom_startup_timeout model=%s timeout_s=%g saw_response=%s",
+                    model,
+                    startup_timeout_seconds,
+                    captured_response is not None,
+                )
                 raise RuntimeError(
                     f"Doubao DOM stream startup timed out after {startup_timeout_seconds:g}s"
                 )
             time.sleep(poll_interval_seconds)
         else:
+            logger.warning(
+                "doubao_dom_stream_timeout model=%s timeout_s=%.0f emitted_chars=%d",
+                model,
+                timeout_seconds,
+                len(emitted),
+            )
             raise RuntimeError(f"Doubao DOM stream timed out after {int(timeout_seconds)}s")
     finally:
         _detach_page_listener(page, "response", handle_response)
         if not emitted and not last_text:
             _stop_doubao_dom_generation(page)
+        logger.info(
+            "doubao_dom_stream_finished model=%s emitted_chars=%d first_token_ms=%s total_ms=%.0f",
+            model,
+            len(emitted),
+            f"{first_piece_ms:.0f}" if first_piece_ms is not None else "none",
+            _log_elapsed_ms(started),
+        )
 
     payload = ""
     if captured_response is not None:
@@ -3415,9 +3885,20 @@ def _is_doubao_chat_completion_response(response, message: str) -> bool:
 
 
 def _normalize_doubao_message_text(value: str) -> str:
+    """Collapse the message to a whitespace-normalised form.
+
+    Doubao's composer is not a faithful transport: `fill()`-style insertion can
+    flatten `"a\\n\\nb"` into `"a  b"`, and the page re-serialises the editor DOM
+    before posting. Comparing on raw text then makes the request body look
+    unrelated to what the caller sent, so the response matcher drops the
+    response and the caller waits out the whole timeout. Newlines and runs of
+    spaces carry no meaning for identifying a message here, so fold them all to
+    a single space.
+    """
     text = str(value or "")
     text = text.replace("\\r\\n", "\n").replace("\\n", "\n")
-    return text.replace("\r\n", "\n").strip()
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return " ".join(text.split())
 
 
 def _extract_doubao_request_text_candidates(post_data: str) -> list[str]:
@@ -3524,37 +4005,32 @@ def _select_doubao_model(page, model: str) -> None:
     if not candidate_labels:
         return
 
+    # Current builds label the trigger "豆包 快速" / "豆包 专家" and the popup
+    # items the same way; legacy builds used bare "快速" / "思考" / "专家" on an
+    # `aria-haspopup="menu"` trigger. Find the trigger by ANY mode label (it
+    # currently shows the active mode, which may differ from the target), then
+    # click with real Playwright events — the menu is Radix, which ignores a JS
+    # `.click()`.
+    trigger_pattern = re.compile(
+        r"^(?:豆包\s*)?(?:"
+        + "|".join(re.escape(label) for label in _DOUBAO_ALL_MODEL_MENU_LABELS)
+        + r")"
+    )
+    target_pattern = re.compile(
+        r"^(?:豆包\s*)?(?:"
+        + "|".join(re.escape(label) for label in candidate_labels)
+        + r")"
+    )
     try:
-        current_label = str(
-            page.evaluate(
-                """
-                () => {
-                  const clean = (s) => (s || "").replace(/\\s+/g, " ").trim();
-                  const labels = Array.from(document.querySelectorAll('button[aria-haspopup="menu"]'))
-                    .map((el) => clean(el.innerText || el.textContent || ""))
-                    .filter(Boolean);
-                  return labels.find((text) => /^(快速|思考|专家)/.test(text)) || "";
-                }
-                """
-            )
-        ).strip()
-        if current_label and any(current_label.startswith(label) for label in candidate_labels):
+        trigger = page.locator("button, [role='button']").filter(has_text=trigger_pattern).last
+        current_label = str(trigger.inner_text(timeout=2000)).strip().replace("\n", " ")
+        if target_pattern.match(current_label):
             return
-
-        model_selector = page.locator('button[aria-haspopup="menu"]').filter(
-            has_text=re.compile(r"^(快速|思考|专家)")
-        ).first
-        model_selector.wait_for(timeout=3000)
-        model_selector.click(timeout=30000)
-        for label in candidate_labels:
-            try:
-                menu_item = page.get_by_role("menuitem", name=re.compile(rf"^{re.escape(label)}"))
-                menu_item.first.wait_for(timeout=3000)
-                menu_item.first.click(timeout=30000)
-                page.wait_for_timeout(300)
-                return
-            except Exception:
-                continue
+        trigger.click(timeout=5000)
+        page.wait_for_timeout(400)
+        menu_item = page.get_by_role("menuitem").filter(has_text=target_pattern).last
+        menu_item.click(timeout=5000)
+        page.wait_for_timeout(300)
     except Exception:
         return
 

@@ -1,7 +1,9 @@
 import base64
 import json
+import re
 import threading
 import time
+from pathlib import Path
 
 import httpx
 import pytest
@@ -10,12 +12,14 @@ from opentoken.models.provider_credentials import ProviderCredentialRecord
 from opentoken.providers.base import ProviderRateLimitError
 from opentoken.providers.camoufox_clients import (
     CamoufoxProviderClient,
+    _DOUBAO_COMPOSER_SELECTOR,
     _DOUBAO_URL,
     _GLMIntlDomStreamProjector,
     _advance_text_stream_state,
     _dom_send_and_wait_glm_intl,
     _dom_send_and_wait_doubao,
     _dom_send_and_wait_glm_cn,
+    _extract_doubao_dom_candidate_text,
     _extract_glm_error_detail,
     _fetch_doubao_browser_completion,
     _fetch_qwen_cn_browser_completion,
@@ -157,6 +161,22 @@ def test_extract_qwen_cn_candidate_text_ignores_pure_prompt_echo() -> None:
     )
 
     assert text == ""
+
+
+def test_extract_doubao_dom_candidate_text_returns_answer_blocks_only() -> None:
+    text = _extract_doubao_dom_candidate_text(
+        "数到三",
+        answer_texts=["一、二、三", "数到三"],
+    )
+
+    assert text == "一、二、三"
+
+
+def test_doubao_composer_selector_supports_tiptap_editor() -> None:
+    # Doubao replaced its <textarea> with a TipTap/ProseMirror contenteditable.
+    assert 'div[contenteditable="true"].ProseMirror' in _DOUBAO_COMPOSER_SELECTOR
+    # Legacy builds (and A/B buckets) still use the semi-design textarea.
+    assert "textarea.semi-input-textarea" in _DOUBAO_COMPOSER_SELECTOR
 
 
 def test_stream_qwen_intl_browser_completion_yields_incremental_chunks() -> None:
@@ -2590,11 +2610,13 @@ def test_stream_doubao_dom_completion_yields_incremental_text_and_persists_conve
             self.keyboard = FakeKeyboard()
             self.locator_instance = FakeLocator()
             self.listeners: dict[str, object] = {}
+            self.html_inserts: list[str] = []
+            self.composer_text = ""
             self.snapshots = [
-                {"markdownTexts": [], "messageTexts": [prompt], "composerBusy": True},
-                {"markdownTexts": ["dou"], "messageTexts": [f"{prompt} dou"], "composerBusy": True},
-                {"markdownTexts": ["doubao"], "messageTexts": [f"{prompt} doubao"], "composerBusy": False},
-                {"markdownTexts": ["doubao"], "messageTexts": [f"{prompt} doubao"], "composerBusy": False},
+                {"answerTexts": [], "generationDone": False},
+                {"answerTexts": ["dou"], "generationDone": False},
+                {"answerTexts": ["doubao"], "generationDone": True},
+                {"answerTexts": ["doubao"], "generationDone": True},
             ]
 
         def locator(self, selector: str) -> FakeLocator:
@@ -2611,10 +2633,19 @@ def test_stream_doubao_dom_completion_yields_incremental_text_and_persists_conve
             self.listeners.pop(event_name, None)
 
         def evaluate(self, script: str, arg: object | None = None):
-            if "markdownCount" in script:
-                return {"markdownCount": 0, "messageCount": 0}
-            if "markdownTexts" in script:
+            if "receiveTurnCount" in script:
+                return {"receiveTurnCount": 0}
+            if "generationDone" in script:
                 return self.snapshots.pop(0)
+            if "execCommand" in script:
+                # Model the one-shot html fill: ProseMirror renders one <p> per
+                # line, so the composer text is the paragraph text joined by \n.
+                html = str((arg or {}).get("html", ""))
+                self.html_inserts.append(html)
+                self.composer_text = "\n".join(re.findall(r"<p>(.*?)</p>", html))
+                return "ok"
+            if "innerText" in script:
+                return self.composer_text
             if "g-send-msg-btn-bg" in script:
                 callback = self.listeners.get("response")
                 if callable(callback):
@@ -2644,11 +2675,12 @@ def test_stream_doubao_dom_completion_yields_incremental_text_and_persists_conve
     assert session.metadata["doubao_conversation_id"] == "doubao-conv-dom"
     assert captured["persisted_conversation_id"] == "doubao-conv-dom"
     assert page.locator_instance.clicked is True
-    assert page.keyboard.actions == [
-        ("press", "Meta+A"),
-        ("press", "Backspace"),
-        ("type", prompt),
-    ]
+    # The prompt must be delivered by the single one-shot html fill, not by
+    # typing it: per-line keystrokes cost ~30ms each, which is what made a
+    # large-prompt request look hung for minutes.
+    assert len(page.html_inserts) == 1
+    assert prompt in page.html_inserts[0]
+    assert page.keyboard.actions == []
 
 
 def test_stream_doubao_dom_completion_raises_rate_limit_before_startup_timeout() -> None:
@@ -2701,7 +2733,7 @@ def test_stream_doubao_dom_completion_raises_rate_limit_before_startup_timeout()
             self.locator_instance = FakeLocator()
             self.listeners: dict[str, object] = {}
             self.snapshots = [
-                {"markdownTexts": [], "messageTexts": [prompt], "composerBusy": False},
+                {"answerTexts": [], "generationDone": True},
             ]
 
         def locator(self, selector: str) -> FakeLocator:
@@ -2717,9 +2749,9 @@ def test_stream_doubao_dom_completion_raises_rate_limit_before_startup_timeout()
             self.listeners.pop(event_name, None)
 
         def evaluate(self, script: str, arg: object | None = None):
-            if "markdownCount" in script:
-                return {"markdownCount": 0, "messageCount": 0}
-            if "markdownTexts" in script:
+            if "receiveTurnCount" in script:
+                return {"receiveTurnCount": 0}
+            if "generationDone" in script:
                 return self.snapshots.pop(0)
             if "g-send-msg-btn-bg" in script:
                 callback = self.listeners.get("response")
@@ -2808,9 +2840,9 @@ def test_stream_doubao_dom_completion_ignores_semantically_duplicate_final_snaps
             self.locator_instance = FakeLocator()
             self.listeners: dict[str, object] = {}
             self.snapshots = [
-                {"markdownTexts": [], "messageTexts": [prompt], "composerBusy": True},
-                {"markdownTexts": [streamed_text], "messageTexts": [f"{prompt} {streamed_text}"], "composerBusy": False},
-                {"markdownTexts": [streamed_text], "messageTexts": [f"{prompt} {streamed_text}"], "composerBusy": False},
+                {"answerTexts": [], "generationDone": False},
+                {"answerTexts": [streamed_text], "generationDone": True},
+                {"answerTexts": [streamed_text], "generationDone": True},
             ]
 
         def locator(self, selector: str) -> FakeLocator:
@@ -2826,9 +2858,9 @@ def test_stream_doubao_dom_completion_ignores_semantically_duplicate_final_snaps
             self.listeners.pop(event_name, None)
 
         def evaluate(self, script: str, arg: object | None = None):
-            if "markdownCount" in script:
-                return {"markdownCount": 0, "messageCount": 0}
-            if "markdownTexts" in script:
+            if "receiveTurnCount" in script:
+                return {"receiveTurnCount": 0}
+            if "generationDone" in script:
                 return self.snapshots.pop(0)
             if "g-send-msg-btn-bg" in script:
                 callback = self.listeners.get("response")
@@ -2904,22 +2936,19 @@ def test_stream_doubao_dom_completion_resets_after_large_replacement_snapshot() 
             self.locator_instance = FakeLocator()
             self.listeners: dict[str, object] = {}
             self.snapshots = [
-                {"markdownTexts": [], "messageTexts": [prompt], "composerBusy": True},
-                {"markdownTexts": ["第一版结尾。"], "messageTexts": [f"{prompt} 第一版结尾。"], "composerBusy": True},
+                {"answerTexts": [], "generationDone": False},
+                {"answerTexts": ["第一版结尾。"], "generationDone": False},
                 {
-                    "markdownTexts": ["重新开始：完整版第一段。"],
-                    "messageTexts": [f"{prompt} 重新开始：完整版第一段。"],
-                    "composerBusy": True,
+                    "answerTexts": ["重新开始：完整版第一段。"],
+                    "generationDone": False,
                 },
                 {
-                    "markdownTexts": ["重新开始：完整版第一段。第二段。"],
-                    "messageTexts": [f"{prompt} 重新开始：完整版第一段。第二段。"],
-                    "composerBusy": False,
+                    "answerTexts": ["重新开始：完整版第一段。第二段。"],
+                    "generationDone": True,
                 },
                 {
-                    "markdownTexts": ["重新开始：完整版第一段。第二段。"],
-                    "messageTexts": [f"{prompt} 重新开始：完整版第一段。第二段。"],
-                    "composerBusy": False,
+                    "answerTexts": ["重新开始：完整版第一段。第二段。"],
+                    "generationDone": True,
                 },
             ]
 
@@ -2936,9 +2965,9 @@ def test_stream_doubao_dom_completion_resets_after_large_replacement_snapshot() 
             self.listeners.pop(event_name, None)
 
         def evaluate(self, script: str, arg: object | None = None):
-            if "markdownCount" in script:
-                return {"markdownCount": 0, "messageCount": 0}
-            if "markdownTexts" in script:
+            if "receiveTurnCount" in script:
+                return {"receiveTurnCount": 0}
+            if "generationDone" in script:
                 return self.snapshots.pop(0)
             if "g-send-msg-btn-bg" in script:
                 callback = self.listeners.get("response")
@@ -2965,7 +2994,7 @@ def test_stream_doubao_dom_completion_resets_after_large_replacement_snapshot() 
     assert pieces == ["第一版结尾。", "重新开始：完整版第一段。", "第二段。"]
 
 
-def test_stream_doubao_prefers_browser_stream_over_dom_fallback(monkeypatch) -> None:
+def test_stream_doubao_prefers_dom_stream_over_browser_fetch(monkeypatch) -> None:
     credentials = ProviderCredentialRecord(
         provider="doubao",
         kind="browser_session",
@@ -3017,15 +3046,17 @@ def test_stream_doubao_prefers_browser_stream_over_dom_fallback(monkeypatch) -> 
     )
     monkeypatch.setattr(
         "opentoken.providers.camoufox_clients._stream_doubao_browser_completion",
-        lambda page, *, session, client, message, model: iter(["real", " stream"]),
+        lambda page, *, session, client, message, model: (_ for _ in ()).throw(
+            AssertionError("browser fetch should not run when DOM stream succeeds")
+        ),
     )
 
-    def unexpected_dom(*args, **kwargs):
-        raise AssertionError("DOM fallback should not run when browser stream succeeds")
+    def dom_stream(*args, **kwargs):
+        return iter(["real", " stream"])
 
     monkeypatch.setattr(
         "opentoken.providers.camoufox_clients._stream_doubao_dom_completion",
-        unexpected_dom,
+        dom_stream,
     )
 
     pieces = list(client._stream_doubao(message="hello", model="doubao-seed-2.0"))
@@ -3033,7 +3064,7 @@ def test_stream_doubao_prefers_browser_stream_over_dom_fallback(monkeypatch) -> 
     assert pieces == ["real", " stream"]
 
 
-def test_stream_doubao_defaults_to_browser_first_even_for_pro_and_thinking_models(monkeypatch) -> None:
+def test_stream_doubao_defaults_to_dom_first_for_all_models(monkeypatch) -> None:
     credentials = ProviderCredentialRecord(
         provider="doubao",
         kind="browser_session",
@@ -3087,22 +3118,22 @@ def test_stream_doubao_defaults_to_browser_first_even_for_pro_and_thinking_model
         )
         monkeypatch.setattr(
             "opentoken.providers.camoufox_clients._stream_doubao_browser_completion",
-            lambda page, *, session, client, message, model: (
-                call_order.append("browser") or iter(["ok"])
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("browser fetch should not run before DOM by default")
             ),
         )
         monkeypatch.setattr(
             "opentoken.providers.camoufox_clients._stream_doubao_dom_completion",
-            lambda *args, **kwargs: (_ for _ in ()).throw(
-                AssertionError("DOM should not run before browser by default")
+            lambda page, *, session, client, message, model: (
+                call_order.append("dom") or iter(["ok"])
             ),
         )
 
         assert list(client._stream_doubao(message="hello", model=model)) == ["ok"]
-        assert call_order == [f"select:{model}", "browser"]
+        assert call_order == [f"select:{model}", "dom"]
 
 
-def test_stream_doubao_falls_back_to_dom_when_browser_stream_completes_silently(monkeypatch) -> None:
+def test_stream_doubao_falls_back_to_browser_when_dom_stream_completes_silently(monkeypatch) -> None:
     credentials = ProviderCredentialRecord(
         provider="doubao",
         kind="browser_session",
@@ -3156,23 +3187,23 @@ def test_stream_doubao_falls_back_to_dom_when_browser_stream_completes_silently(
     monkeypatch.setattr(
         "opentoken.providers.camoufox_clients._stream_doubao_browser_completion",
         lambda page, *, session, client, message, model: (
-            call_order.append("browser") or iter(())
+            call_order.append("browser") or iter(["补", "救"])
         ),
     )
     monkeypatch.setattr(
         "opentoken.providers.camoufox_clients._stream_doubao_dom_completion",
         lambda page, *, session, client, message, model: (
-            call_order.append("dom") or iter(["补", "救"])
+            call_order.append("dom") or iter(())
         ),
     )
 
     pieces = list(client._stream_doubao(message="hello", model="doubao-seed-2.0"))
 
     assert pieces == ["补", "救"]
-    assert call_order == ["select:doubao-seed-2.0", "browser", "dom"]
+    assert call_order == ["select:doubao-seed-2.0", "dom", "browser"]
 
 
-def test_stream_doubao_falls_back_to_dom_when_browser_stream_startup_times_out(monkeypatch) -> None:
+def test_stream_doubao_falls_back_to_browser_when_dom_stream_startup_times_out(monkeypatch) -> None:
     credentials = ProviderCredentialRecord(
         provider="doubao",
         kind="browser_session",
@@ -3206,17 +3237,17 @@ def test_stream_doubao_falls_back_to_dom_when_browser_stream_startup_times_out(m
         metadata={"doubao_request_params": {"aid": "497858"}},
     )
 
-    def slow_browser_stream(*, startup_timeout_seconds=None):
+    def slow_dom_stream(*, startup_timeout_seconds=None):
         if startup_timeout_seconds is not None and startup_timeout_seconds < 0.05:
             raise RuntimeError(
-                f"Doubao browser stream startup timed out after {startup_timeout_seconds:g}s"
+                f"Doubao DOM stream startup timed out after {startup_timeout_seconds:g}s"
             )
         time.sleep(0.05)
         yield "慢"
 
     monkeypatch.setattr(
         camoufox_module,
-        "_DOUBAO_BROWSER_STREAM_STARTUP_TIMEOUT_SECONDS",
+        "_DOUBAO_DOM_STREAM_STARTUP_TIMEOUT_SECONDS",
         0.01,
         raising=False,
     )
@@ -3239,25 +3270,25 @@ def test_stream_doubao_falls_back_to_dom_when_browser_stream_startup_times_out(m
     )
     monkeypatch.setattr(
         "opentoken.providers.camoufox_clients._stream_doubao_browser_completion",
-        lambda page, *, session, client, message, model, startup_timeout_seconds=None: (
-            call_order.append("browser")
-            or slow_browser_stream(startup_timeout_seconds=startup_timeout_seconds)
+        lambda page, *, session, client, message, model: (
+            call_order.append("browser") or iter(["补", "救"])
         ),
     )
     monkeypatch.setattr(
         "opentoken.providers.camoufox_clients._stream_doubao_dom_completion",
-        lambda page, *, session, client, message, model: (
-            call_order.append("dom") or iter(["补", "救"])
+        lambda page, *, session, client, message, model, startup_timeout_seconds=None: (
+            call_order.append("dom")
+            or slow_dom_stream(startup_timeout_seconds=startup_timeout_seconds)
         ),
     )
 
     pieces = list(client._stream_doubao(message="hello", model="doubao-seed-2.0"))
 
     assert pieces == ["补", "救"]
-    assert call_order == ["select:doubao-seed-2.0", "browser", "dom"]
+    assert call_order == ["select:doubao-seed-2.0", "dom", "browser"]
 
 
-def test_stream_doubao_falls_back_to_dom_when_browser_stream_rate_limited(monkeypatch) -> None:
+def test_stream_doubao_falls_back_to_browser_when_dom_stream_rate_limited(monkeypatch) -> None:
     credentials = ProviderCredentialRecord(
         provider="doubao",
         kind="browser_session",
@@ -3308,29 +3339,28 @@ def test_stream_doubao_falls_back_to_dom_when_browser_stream_rate_limited(monkey
         "opentoken.providers.camoufox_clients._select_doubao_model",
         lambda page, model: call_order.append(f"select:{model}"),
     )
-    monkeypatch.setattr(
-        "opentoken.providers.camoufox_clients._stream_doubao_browser_completion",
-        lambda page, *, session, client, message, model, startup_timeout_seconds=None: (
-            call_order.append("browser")
-            or (_ for _ in ()).throw(ProviderRateLimitError("rate limited"))
-        ),
-    )
     def _dom_stream(page, *, session, client, message, model, startup_timeout_seconds=None):
         call_order.append("dom")
-        yield "杭州"
-        yield "很美。"
+        raise ProviderRateLimitError("rate limited")
+        yield  # pragma: no cover - makes this a generator
 
     monkeypatch.setattr(
         "opentoken.providers.camoufox_clients._stream_doubao_dom_completion",
         _dom_stream,
     )
+    monkeypatch.setattr(
+        "opentoken.providers.camoufox_clients._stream_doubao_browser_completion",
+        lambda page, *, session, client, message, model, startup_timeout_seconds=None: (
+            call_order.append("browser") or iter(["杭州", "很美。"])
+        ),
+    )
 
-    # The in-page API/browser stream is the path Doubao anti-bot rate-limits; the
-    # human-like DOM compose+send path gets through, so a 429 on the browser
-    # attempt MUST fall back to DOM (verified live: API 429 while DOM succeeds).
+    # The human-like DOM compose+send path is the primary route; if upstream
+    # rate-limits it before any bytes are emitted, the in-page fetch path is
+    # still worth a try rather than failing the request outright.
     pieces = list(client._stream_doubao(message="hello", model="doubao-seed-2.0"))
     assert "".join(pieces) == "杭州很美。"
-    assert "browser" in call_order and "dom" in call_order
+    assert call_order == ["select:doubao-seed-2.0", "dom", "browser"]
 
 
 def test_stream_doubao_ignores_persisted_conversation_id(monkeypatch) -> None:
@@ -3393,18 +3423,18 @@ def test_stream_doubao_ignores_persisted_conversation_id(monkeypatch) -> None:
         lambda page, model: None,
     )
 
-    def fake_browser_stream(page, *, session, client, message, model):
+    def fake_dom_stream(page, *, session, client, message, model):
         seen["conversation_id"] = session.metadata.get("doubao_conversation_id")
         yield "fresh"
 
     monkeypatch.setattr(
-        "opentoken.providers.camoufox_clients._stream_doubao_browser_completion",
-        fake_browser_stream,
+        "opentoken.providers.camoufox_clients._stream_doubao_dom_completion",
+        fake_dom_stream,
     )
     monkeypatch.setattr(
-        "opentoken.providers.camoufox_clients._stream_doubao_dom_completion",
+        "opentoken.providers.camoufox_clients._stream_doubao_browser_completion",
         lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("DOM fallback should not run when browser stream succeeds")
+            AssertionError("browser fetch should not run when DOM stream succeeds")
         ),
     )
 
@@ -3952,6 +3982,8 @@ def test_dom_send_and_wait_doubao_uses_live_textarea_selector_and_captures_respo
             self.keyboard = FakeKeyboard()
             self.locator_instance = FakeLocator()
             self.listeners: dict[str, object] = {}
+            self.html_inserts: list[str] = []
+            self.composer_text = ""
 
         def locator(self, selector: str) -> FakeLocator:
             assert "textarea" in selector
@@ -3967,6 +3999,13 @@ def test_dom_send_and_wait_doubao_uses_live_textarea_selector_and_captures_respo
             self.listeners.pop(event_name, None)
 
         def evaluate(self, script: str, arg: object | None = None):
+            if "execCommand" in script:
+                html = str((arg or {}).get("html", ""))
+                self.html_inserts.append(html)
+                self.composer_text = "\n".join(re.findall(r"<p>(.*?)</p>", html))
+                return "ok"
+            if "innerText" in script:
+                return self.composer_text
             if "g-send-msg-btn-bg" in script:
                 callback = self.listeners.get("response")
                 if callable(callback):
@@ -3998,11 +4037,9 @@ def test_dom_send_and_wait_doubao_uses_live_textarea_selector_and_captures_respo
     assert session.metadata["doubao_conversation_id"] == "doubao-conv-1"
     assert persisted["conversation_id"] == "doubao-conv-1"
     assert page.locator_instance.clicked is True
-    assert page.keyboard.actions == [
-        ("press", "Meta+A"),
-        ("press", "Backspace"),
-        ("type", prompt),
-    ]
+    assert len(page.html_inserts) == 1
+    assert prompt in page.html_inserts[0]
+    assert page.keyboard.actions == []
 
 
 def test_dom_send_and_wait_doubao_recovers_when_composer_click_is_intercepted() -> None:
@@ -5306,6 +5343,95 @@ def test_with_page_does_not_close_browser_session_after_success(monkeypatch, tmp
     assert closed == []  # session kept alive for reuse
 
 
+class _FakeDoubaoModelMenuPage:
+    """Minimal Playwright stand-in for `_select_doubao_model`.
+
+    Doubao's trigger renders the *currently active* mode ("豆包 快速"), so the
+    trigger must be located by any mode label and compared against the target
+    afterwards — matching the target label directly finds nothing when a switch
+    is actually needed.
+    """
+
+    def __init__(self, current_label: str) -> None:
+        self.current_label = current_label
+        self.clicks: list[str] = []
+
+    def locator(self, selector: str):
+        page = self
+
+        class _Trigger:
+            def filter(self, has_text):
+                assert has_text.search("豆包 快速"), has_text.pattern
+                return self
+
+            @property
+            def last(self):
+                return self
+
+            def inner_text(self, timeout=None):
+                return page.current_label
+
+            def click(self, timeout=None):
+                page.clicks.append("trigger")
+
+        return _Trigger()
+
+    def get_by_role(self, role: str):
+        page = self
+
+        class _MenuItem:
+            def filter(self, has_text):
+                page.matched_menu_item = has_text.pattern
+                return self
+
+            @property
+            def last(self):
+                return self
+
+            def click(self, timeout=None):
+                page.clicks.append("menuitem")
+
+        assert role == "menuitem"
+        return _MenuItem()
+
+    def wait_for_timeout(self, timeout_ms: int) -> None:
+        return None
+
+
+def test_select_doubao_model_switches_when_a_different_mode_is_active() -> None:
+    page = _FakeDoubaoModelMenuPage("豆包 快速")
+
+    camoufox_module._select_doubao_model(page, "doubao-pro")
+
+    assert page.clicks == ["trigger", "menuitem"]
+    assert "专家" in page.matched_menu_item
+
+
+def test_select_doubao_model_skips_click_when_target_mode_already_active() -> None:
+    page = _FakeDoubaoModelMenuPage("豆包 专家")
+
+    camoufox_module._select_doubao_model(page, "doubao-pro")
+
+    assert page.clicks == []
+
+
+def test_select_doubao_model_noops_for_unknown_model() -> None:
+    page = _FakeDoubaoModelMenuPage("豆包 快速")
+
+    camoufox_module._select_doubao_model(page, "unknown-model")
+
+    assert page.clicks == []
+
+
+def test_select_doubao_model_swallows_missing_trigger() -> None:
+    class _BrokenPage:
+        def locator(self, selector):
+            raise RuntimeError("no such button")
+
+    # Model switching is best-effort: a markup drift must not fail the chat.
+    camoufox_module._select_doubao_model(_BrokenPage(), "doubao-pro")
+
+
 def test_select_all_chord_is_platform_appropriate(monkeypatch):
     """The composer-clearing select-all chord must be Ctrl+A off macOS;
     a hardcoded Meta+A silently no-ops on Linux/Windows, leaving stale draft
@@ -5324,3 +5450,437 @@ def test_select_all_chord_is_platform_appropriate(monkeypatch):
     finally:
         # Restore a clean module state for any later tests in the session.
         importlib.reload(camoufox_module)
+
+
+def _doubao_credentials() -> ProviderCredentialRecord:
+    return ProviderCredentialRecord(
+        provider="doubao",
+        kind="browser_session",
+        cookie="sessionid=session-1",
+        headers={},
+        user_agent="ua",
+        metadata={"sessionid": "session-1"},
+        status="valid",
+    )
+
+
+def _stub_media_page(monkeypatch, page):
+    import contextlib
+
+    @contextlib.contextmanager
+    def fake_page(self):
+        yield object(), page
+
+    monkeypatch.setattr(CamoufoxProviderClient, "_doubao_media_page", fake_page)
+
+
+def test_generate_images_delegates_to_the_doubao_media_flow(monkeypatch) -> None:
+    from opentoken.providers import doubao_media
+
+    page = object()
+    resets: list[object] = []
+    calls: list[dict[str, object]] = []
+    asset = doubao_media.MediaAsset(url="https://cdn.example/a.png", media_type="image/png")
+
+    _stub_media_page(monkeypatch, page)
+    monkeypatch.setattr(
+        CamoufoxProviderClient,
+        "_reset_doubao_composer",
+        lambda self, target: resets.append(target),
+    )
+
+    def fake_generate(target, *, prompt, model, count, timeout_seconds):
+        calls.append(
+            {
+                "page": target,
+                "prompt": prompt,
+                "model": model.id,
+                "count": count,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        return [asset]
+
+    monkeypatch.setattr(doubao_media, "generate_doubao_images", fake_generate)
+
+    client = CamoufoxProviderClient("doubao", _doubao_credentials())
+    assets = client.generate_images(
+        message="一只猫",
+        model="doubao/seedream-5.0-flash",
+        count=2,
+        timeout_seconds=30,
+    )
+
+    assert assets == [asset]
+    assert calls == [
+        {
+            "page": page,
+            "prompt": "一只猫",
+            "model": "doubao/seedream-5.0-flash",
+            "count": 2,
+            "timeout_seconds": 30,
+        }
+    ]
+    assert resets == [page]
+
+
+def test_generate_images_always_resets_the_composer_on_failure(monkeypatch) -> None:
+    from opentoken.providers import doubao_media
+
+    page = object()
+    resets: list[object] = []
+
+    _stub_media_page(monkeypatch, page)
+    monkeypatch.setattr(
+        CamoufoxProviderClient,
+        "_reset_doubao_composer",
+        lambda self, target: resets.append(target),
+    )
+
+    def fake_generate(target, **kwargs):
+        raise RuntimeError("render blew up")
+
+    monkeypatch.setattr(doubao_media, "generate_doubao_images", fake_generate)
+
+    client = CamoufoxProviderClient("doubao", _doubao_credentials())
+    with pytest.raises(RuntimeError, match="render blew up"):
+        client.generate_images(message="一只猫", model="seedream-4.5")
+
+    assert resets == [page]
+
+
+def test_generate_video_delegates_to_the_doubao_media_flow(monkeypatch) -> None:
+    from opentoken.providers import doubao_media
+
+    page = object()
+    resets: list[object] = []
+    calls: list[dict[str, object]] = []
+    asset = doubao_media.MediaAsset(
+        url="https://vdl.example/v.mp4", media_type="video/mp4", duration_seconds=10.0
+    )
+
+    _stub_media_page(monkeypatch, page)
+    monkeypatch.setattr(
+        CamoufoxProviderClient,
+        "_reset_doubao_composer",
+        lambda self, target: resets.append(target),
+    )
+
+    def fake_generate(
+        target,
+        *,
+        prompt,
+        model,
+        timeout_seconds,
+        seconds=None,
+        size=None,
+        reference_images=(),
+    ):
+        calls.append(
+            {
+                "page": target,
+                "prompt": prompt,
+                "model": model.id,
+                "timeout_seconds": timeout_seconds,
+                "seconds": seconds,
+                "size": size,
+                "reference_images": list(reference_images),
+            }
+        )
+        return asset
+
+    monkeypatch.setattr(doubao_media, "generate_doubao_video", fake_generate)
+
+    client = CamoufoxProviderClient("doubao", _doubao_credentials())
+    result = client.generate_video(
+        message="一只奔跑的小猫", model="doubao/seedance-2.0-mini", timeout_seconds=120
+    )
+
+    assert result == asset
+    assert calls == [
+        {
+            "page": page,
+            "prompt": "一只奔跑的小猫",
+            "model": "doubao/seedance-2.0-mini",
+            "timeout_seconds": 120,
+            "seconds": None,
+            "size": None,
+            "reference_images": [],
+        }
+    ]
+    assert resets == [page]
+
+
+def test_generate_video_forwards_seconds_size_and_references(monkeypatch) -> None:
+    """The API's options have to reach the browser flow, not stop at the client."""
+    from opentoken.providers import doubao_media
+
+    page = object()
+    calls: list[dict[str, object]] = []
+    asset = doubao_media.MediaAsset(url="https://vdl.example/v.mp4", media_type="video/mp4")
+
+    _stub_media_page(monkeypatch, page)
+    monkeypatch.setattr(
+        CamoufoxProviderClient, "_reset_doubao_composer", lambda self, target: None
+    )
+
+    def fake_generate(target, **kwargs):
+        calls.append(kwargs)
+        return asset
+
+    monkeypatch.setattr(doubao_media, "generate_doubao_video", fake_generate)
+
+    reference = Path("/tmp/opentoken-test-reference.png")
+    client = CamoufoxProviderClient("doubao", _doubao_credentials())
+    client.generate_video(
+        message="让这只猫跑起来",
+        model="doubao/seedance-2.0-mini",
+        timeout_seconds=120,
+        seconds=12,
+        size="1280x720",
+        reference_images=[reference],
+    )
+
+    assert calls[0]["seconds"] == 12
+    assert calls[0]["size"] == "1280x720"
+    assert list(calls[0]["reference_images"]) == [reference]
+
+
+def test_media_generation_rejects_non_doubao_providers_and_unknown_models() -> None:
+    client = CamoufoxProviderClient("qwen-intl", _doubao_credentials())
+    with pytest.raises(RuntimeError, match="not supported"):
+        client.generate_images(message="hi", model="doubao/seedream-5.0-flash")
+    with pytest.raises(RuntimeError, match="not supported"):
+        client.generate_video(message="hi", model="doubao/seedance-2.0-mini")
+
+    doubao_client = CamoufoxProviderClient("doubao", _doubao_credentials())
+    with pytest.raises(RuntimeError, match="Unknown image model"):
+        doubao_client.generate_images(message="hi", model="seedance-2.0-mini")
+    with pytest.raises(RuntimeError, match="Unknown video model"):
+        doubao_client.generate_video(message="hi", model="seedream-4.5")
+
+
+def test_doubao_message_matching_tolerates_flattened_whitespace() -> None:
+    """Doubao's composer can flatten `a\\n\\nb` into `a  b` before posting.
+
+    The old exact/newline-preserving comparison then rejected the very response
+    it was waiting for, so the non-stream path burned its full 120s listener
+    timeout and clients saw a dead request.
+    """
+    from opentoken.providers.camoufox_clients import _normalize_doubao_message_text
+
+    sent = "第一行：你好\n\n第二行：请回答 OK"
+    flattened = "第一行：你好  第二行：请回答 OK"
+
+    assert _normalize_doubao_message_text(sent) == _normalize_doubao_message_text(flattened)
+
+
+def test_doubao_message_matching_still_distinguishes_different_text() -> None:
+    from opentoken.providers.camoufox_clients import _normalize_doubao_message_text
+
+    assert _normalize_doubao_message_text("hello world") != _normalize_doubao_message_text(
+        "hello there"
+    )
+
+
+def test_is_doubao_chat_completion_response_accepts_a_flattened_post_body() -> None:
+    from opentoken.providers.camoufox_clients import _is_doubao_chat_completion_response
+
+    message = "第一行：你好\n\n第二行：请回答 OK"
+
+    class Request:
+        method = "POST"
+        post_data = json.dumps(
+            {
+                "messages": [
+                    {
+                        "content": json.dumps({"text": "第一行：你好  第二行：请回答 OK"}),
+                        "content_type": 2001,
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+    class Response:
+        url = "https://www.doubao.com/chat/completion?aid=497858"
+        headers = {"content-type": "text/event-stream"}
+        request = Request()
+
+    assert _is_doubao_chat_completion_response(Response(), message)
+
+
+def test_doubao_type_multiline_composer_uses_hard_breaks_not_enter() -> None:
+    """Enter submits on Doubao, so line breaks must be Shift+Enter."""
+    from opentoken.providers.camoufox_clients import _doubao_type_multiline_composer
+
+    class Keyboard:
+        def __init__(self) -> None:
+            self.presses: list[str] = []
+            self.inserted: list[str] = []
+
+        def press(self, key: str) -> None:
+            self.presses.append(key)
+
+        def insert_text(self, text: str) -> None:
+            self.inserted.append(text)
+
+        def type(self, text: str, delay: int = 0) -> None:
+            self.inserted.append(text)
+
+    class Page:
+        def __init__(self) -> None:
+            self.keyboard = Keyboard()
+            self.filled = ""
+
+        def wait_for_timeout(self, timeout_ms: int) -> None:
+            return None
+
+        def evaluate(self, script: str):
+            return self.filled
+
+    page = Page()
+    message = "第一行\n第二行"
+
+    page.filled = message
+    original_insert = page.keyboard.insert_text
+
+    def insert(text: str) -> None:
+        original_insert(text)
+        page.filled = "\n".join(page.keyboard.inserted)
+
+    page.keyboard.insert_text = insert  # type: ignore[method-assign]
+
+    assert _doubao_type_multiline_composer(page, message) is True
+    assert "Enter" not in page.keyboard.presses
+    assert page.keyboard.presses.count("Shift+Enter") == 1
+    assert page.keyboard.inserted == ["第一行", "第二行"]
+
+
+def test_dom_send_fails_fast_when_no_request_is_issued(monkeypatch) -> None:
+    """A no-op send click must not burn the full 120s listener timeout."""
+    from opentoken.providers import camoufox_clients as module
+
+    monkeypatch.setattr(module, "_select_doubao_model", lambda page, model: None)
+    monkeypatch.setattr(module, "_doubao_fill_composer", lambda page, message: None)
+    monkeypatch.setattr(module, "_doubao_click_send_button", lambda page: None)
+    monkeypatch.setattr(module, "_DOUBAO_SEND_ACK_TIMEOUT_SECONDS", 0.05, raising=False)
+
+    class Page:
+        def __init__(self) -> None:
+            self.listeners: dict[str, list] = {}
+
+        def on(self, event: str, callback) -> None:
+            self.listeners.setdefault(event, []).append(callback)
+
+        def wait_for_timeout(self, timeout_ms: int) -> None:
+            return None
+
+        def evaluate(self, script, arg=None):
+            return {}
+
+        def goto(self, *args, **kwargs) -> None:
+            return None
+
+        keyboard = type("K", (), {"press": lambda self, key: None})()
+
+    class Client:
+        def _persist_doubao_conversation_id(self, conversation_id: str) -> None:
+            return None
+
+    session = type("S", (), {"metadata": {}})()
+
+    with pytest.raises(RuntimeError, match="did not submit the message"):
+        module._dom_send_and_wait_doubao(
+            Page(), session=session, client=Client(), message="hi", model="doubao-seed-2.0"
+        )
+
+
+def test_doubao_message_html_keeps_one_paragraph_per_line() -> None:
+    from opentoken.providers.camoufox_clients import _doubao_message_to_paragraph_html
+
+    html = _doubao_message_to_paragraph_html("a\n\nb\nc")
+
+    assert html == "<p>a</p><p></p><p>b</p><p>c</p>"
+
+
+def test_doubao_message_html_escapes_metacharacters_but_keeps_text_intact() -> None:
+    """The prompt is code/HTML often enough that escaping must be exact.
+
+    A naive `replace('&', ...)` order or a missing escape would either corrupt the
+    prompt or let the editor parse it as real markup (dropping lines).
+    """
+    from opentoken.providers.camoufox_clients import _doubao_message_to_paragraph_html
+
+    html = _doubao_message_to_paragraph_html('if a < b && c > d: print("<tag>")')
+
+    assert html == '<p>if a &lt; b &amp;&amp; c &gt; d: print("&lt;tag&gt;")</p>'
+    # Un-escaping must recover the original line byte for byte.
+    import html as html_module
+
+    assert html_module.unescape(html)[3:-4] == 'if a < b && c > d: print("<tag>")'
+
+
+def test_doubao_message_html_normalises_crlf() -> None:
+    from opentoken.providers.camoufox_clients import _doubao_message_to_paragraph_html
+
+    assert _doubao_message_to_paragraph_html("a\r\nb") == "<p>a</p><p>b</p>"
+
+
+def test_doubao_insert_message_html_is_one_round_trip() -> None:
+    """The whole prompt must go in a single evaluate call.
+
+    Typing it line by line cost ~30ms of Playwright round trips per line: an
+    88728-char agent prompt blocked 164s before submission, which clients report
+    as a hung request.
+    """
+    from opentoken.providers.camoufox_clients import _doubao_insert_message_html
+
+    calls: list[str] = []
+
+    class Page:
+        def evaluate(self, script, arg=None):
+            calls.append(script)
+            self.payload = arg
+            return "ok"
+
+    page = Page()
+    message = "\n".join(f"line {index}" for index in range(3000))
+
+    assert _doubao_insert_message_html(page, message) is True
+    assert len(calls) == 1
+    assert page.payload["html"].count("<p>") == 3000
+
+
+def test_doubao_insert_message_html_reports_textarea_and_failures() -> None:
+    from opentoken.providers.camoufox_clients import _doubao_insert_message_html
+
+    class Page:
+        def __init__(self, result):
+            self.result = result
+
+        def evaluate(self, script, arg=None):
+            return self.result
+
+    assert _doubao_insert_message_html(Page("textarea"), "hi") is False
+    assert _doubao_insert_message_html(Page("failed"), "hi") is False
+    assert _doubao_insert_message_html(Page(None), "hi") is False
+
+
+def test_doubao_composer_holds_compares_content_not_layout() -> None:
+    """innerText renders blank paragraphs as extra newlines; folding whitespace
+    keeps verification honest without rejecting a correct fill."""
+    from opentoken.providers.camoufox_clients import _doubao_composer_holds
+
+    class Page:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+        def evaluate(self, script, arg=None):
+            return self.text
+
+    message = "a\n\nb"
+    assert _doubao_composer_holds(Page("a\n\n\n\nb"), message) is True
+    assert _doubao_composer_holds(Page("a b"), message) is True
+    assert _doubao_composer_holds(Page("a"), message) is False
+    assert _doubao_composer_holds(Page(""), message) is False

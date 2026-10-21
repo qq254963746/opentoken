@@ -39,6 +39,7 @@ _DISCOVERY_MAX_WORKERS = 8
 _FALLBACK_MODELS: dict[str, list[tuple[str, str]]] = {
     "qwen-intl": [("qwen3.6-plus", "Qwen 3.6 Plus"), ("qwen-max-latest", "Qwen Max")],
     "kimi": [("k2", "Kimi K2"), ("k1", "Kimi K1")],
+    "doubao": [("doubao-seed-2.0", "Doubao 快速"), ("doubao-pro", "Doubao 专家")],
 }
 
 # Providers expose their FULL backend model registry (via the page payload /
@@ -83,10 +84,12 @@ _QWEN_INTL_MODEL_PATTERN = re.compile(
 _QWEN_CN_MODEL_PATTERN = re.compile(
     r"Qwen[0-9A-Za-z.\u4e00-\u9fff-]*-[0-9A-Za-z.\u4e00-\u9fff-]+"
 )
-_DOUBAO_ACTION_BAR_MENU_PATTERN = re.compile(
-    r'"action_bar_menu_config":\{"menu_item_list":(?P<items>\[[\s\S]*?\]),'
-    r'"default_deep_think_auto"',
-)
+# Doubao's model picker moved from `action_bar_menu_config` to
+# `modeSelectConfig` (same `menu_item_list` payload, without the trailing
+# `default_deep_think_auto` key to anchor on). The array is parsed by balanced
+# bracket scan rather than a regex because each item nests its own arrays
+# (`reasoning_effort_config.option_list`), which makes `[^\]]*` truncate early.
+_DOUBAO_MENU_LIST_MARKERS = ('"modeSelectConfig"', '"action_bar_menu_config"')
 _GLM_CN_MODEL_PATTERN = re.compile(
     r"\b(GLM-\d+(?:\.\d+)?(?:[- ](?:Plus|Think|Zero))?)\b",
     flags=re.IGNORECASE,
@@ -262,19 +265,79 @@ def _extract_qwen_cn_models_from_dialog_text(dialog_text: str) -> list[tuple[str
     )
 
 
+def _extract_doubao_menu_items(html: str) -> list[object]:
+    """Locate the model picker's `menu_item_list` payload in the chat page HTML.
+
+    Tried markers, newest first: `modeSelectConfig` (current) then
+    `action_bar_menu_config` (legacy). The JSON array is sliced by balanced
+    brackets so nested arrays inside an item don't truncate it.
+    """
+    for marker in _DOUBAO_MENU_LIST_MARKERS:
+        anchor = html.find(marker)
+        if anchor < 0:
+            continue
+        key_index = html.find('"menu_item_list"', anchor)
+        if key_index < 0:
+            continue
+        array_start = html.find("[", key_index)
+        if array_start < 0:
+            continue
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(array_start, len(html)):
+            char = html[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "[":
+                depth += 1
+            elif char == "]":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        payload = json.loads(html[array_start : index + 1])
+                    except json.JSONDecodeError:
+                        break
+                    return payload if isinstance(payload, list) else []
+    return []
+
+
+def _normalize_doubao_menu_name(raw_name: str) -> str:
+    name = raw_name.strip()
+    # Current picker labels are "豆包 快速" / "豆包 专家"; the legacy ones were
+    # bare "快速" / "思考" / "专家". Normalize to the bare mode word.
+    if name.startswith("豆包"):
+        name = name[len("豆包") :].strip()
+    return name
+
+
+def _doubao_item_is_chat_mode(item: dict[str, object]) -> bool:
+    """`menu_item_list` mixes chat models with the office/creation ones
+    ("工作任务 Auto/Turbo/Pro", "豆包 2.1 Lite"). Only chat-capable entries
+    belong in /v1/models; items predating `conversation_mode_list` are kept."""
+    conversation_modes = item.get("conversation_mode_list")
+    if not isinstance(conversation_modes, list):
+        return True
+    return any(str(mode).strip().lower() == "chat" for mode in conversation_modes)
+
+
 def _extract_doubao_models_from_html(html: str) -> list[tuple[str, str]]:
-    match = _DOUBAO_ACTION_BAR_MENU_PATTERN.search(html)
-    if match is None:
-        return []
-    try:
-        raw_items = json.loads(match.group("items"))
-    except json.JSONDecodeError:
-        return []
+    raw_items = _extract_doubao_menu_items(html)
     models: list[tuple[str, str]] = []
     for item in raw_items:
         if not isinstance(item, dict):
             continue
-        raw_name = str(item.get("name", "")).strip()
+        if not _doubao_item_is_chat_mode(item):
+            continue
+        raw_name = _normalize_doubao_menu_name(str(item.get("name", "")))
         if not raw_name:
             continue
         mapped = None

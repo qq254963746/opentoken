@@ -20,6 +20,8 @@ If you use DeepSeek, Qwen, Kimi, Doubao, GLM, Claude, Gemini, ChatGPT, Grok, and
 
 **Web sessions / browser-harvested (12)**: DeepSeek · Qwen International · Qwen China · Kimi · Claude · Doubao · ChatGPT · Gemini · Grok · GLM International · GLM China · Xiaomi Mimo
 
+**Doubao** additionally serves browser-driven **image generation** (Seedream) and **video generation** (Seedance) — see "Image / video generation" below.
+
 **Direct API keys (4)**:
 - **Manus** (official API)
 - **NVIDIA NIM** — free 40 RPM via `integrate.api.nvidia.com/v1`, covering DeepSeek R1 / Llama 3.3 70B / Qwen 2.5 72B & Coder 32B / Mixtral 8x22B and more. Just a NVIDIA account → `nvapi-...` key, no card needed.
@@ -62,6 +64,7 @@ Credentials never enter the repo — everything lives under `~/.opentoken/`:
 ├── provider-sessions.json   # session state (conversation_id ...; capped 256 LRU)
 ├── responses.json           # /v1/responses history (7d TTL, 1024 LRU)
 ├── files/, uploads/         # /v1/files & /v1/uploads binary blobs
+├── logs/gateway.log         # rotating log (10 MiB x 5, see "Logs & debugging")
 └── model-catalog-cache.json # discovery cache
 ```
 
@@ -197,6 +200,26 @@ curl http://127.0.0.1:32117/v1/models -H 'Authorization: Bearer YOUR_LOCAL_GATEW
 
 `/v1/models` advertises a single **bare `<provider>/<model>`** format: `qwen-intl/qwen3.7-plus`, `deepseek/deepseek-chat`, `nim/deepseek-ai/deepseek-r1`, `unified/openrouter/anthropic/claude-3.5-sonnet`. The provider segment disambiguates collisions (`glm-cn/glm-5` vs `glm-intl/glm-5`). Alias resolution is **case-insensitive**. (The legacy `algae/<provider>/<model>` namespace form is still accepted by the resolver for backward compatibility, but is no longer listed in `/v1/models`.)
 
+Every entry also carries a `capability` field that says which endpoint to call:
+
+```json
+{
+  "object": "list",
+  "data": [
+    {"id": "qwen-intl/qwen3.7-plus", "object": "model", "owned_by": "opentoken", "capability": "text"},
+    {"id": "doubao/seedream-5.0-flash", "object": "model", "owned_by": "opentoken", "capability": "image"},
+    {"id": "doubao/seedance-2.0-mini", "object": "model", "owned_by": "opentoken", "capability": "video"}
+  ]
+}
+```
+
+| `capability` | Endpoint |
+| --- | --- |
+| `text` | `/v1/chat/completions`, `/v1/responses` |
+| `image` | `/v1/images/generations` |
+| `video` | `/v1/videos` |
+| `audio` | Reserved — no audio model yet (Doubao's web skill doesn't accept audio) |
+
 **Chat Completions (streaming)**:
 
 ```bash
@@ -246,6 +269,54 @@ curl -X POST http://127.0.0.1:32117/v1/uploads \
 - Each incoming part is rejected with 413 if `existing_parts_bytes + new_part > declared bytes`.
 - **`GET /v1/files/{id}/content` always returns `application/octet-stream` + `nosniff` + `attachment`** — never the caller-supplied mime_type, so an uploaded text/html or SVG blob can't execute as stored XSS in a browser-reachable deployment.
 
+**Image generation (Doubao Seedream)**:
+
+```bash
+curl http://127.0.0.1:32117/v1/images/generations \
+  -H 'Authorization: Bearer YOUR_LOCAL_GATEWAY_KEY' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "doubao/seedream-5.0-flash",
+    "prompt": "a cat wearing sunglasses, flat illustration style",
+    "n": 2,
+    "response_format": "url"
+  }'
+```
+
+- Drives Doubao's web "图像生成" skill through the logged-in Camoufox session — there is no image API upstream, so `opentoken login doubao` is required first.
+- Models: `doubao/seedream-5.0-flash` (default) · `doubao/seedream-5.0-pro` · `doubao/seedream-4.5` · `doubao/seedream-4.0`. They appear in `/v1/models` only once Doubao credentials exist.
+- `n` is capped at **4**: the web UI renders one image per turn, so `n` runs N serial turns (~20–40s each) rather than a native batch.
+- `response_format=url` returns the signed CDN link directly (Doubao signs it out to 2036, so no gateway-side cache); `b64_json` downloads and inlines base64 for clients that refuse external URLs.
+- Response shape is OpenAI's: `{"created", "model", "data": [{"url"|"b64_json", "revised_prompt"?}]}`.
+- `timeout` bounds the whole request (default 240s, max 600s); a timeout returns **504**.
+
+**Video generation (Doubao Seedance)**:
+
+```bash
+# asynchronous (default): returns a job immediately
+curl http://127.0.0.1:32117/v1/videos/generations \
+  -H 'Authorization: Bearer YOUR_LOCAL_GATEWAY_KEY' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"doubao/seedance-2.0-mini","prompt":"a kitten running across a meadow"}'
+
+curl http://127.0.0.1:32117/v1/videos/generations/vidgen-xxxx \
+  -H 'Authorization: Bearer YOUR_LOCAL_GATEWAY_KEY'
+```
+
+```bash
+# synchronous: block until the render finishes
+curl http://127.0.0.1:32117/v1/videos/generations \
+  -H 'Authorization: Bearer YOUR_LOCAL_GATEWAY_KEY' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"doubao/seedance-2.0-mini","prompt":"a kitten running across a meadow","wait":true}'
+```
+
+- Models: `doubao/seedance-2.0-mini` (default) · `doubao/seedance-2.0-fast` · `doubao/seedance-2.0` · `doubao/seedance-2.5`.
+- Full request/response fields, state machine and error table: **[docs/media-generation-api.md](docs/media-generation-api.md)** (Chinese).
+- The async POST returns `{"id", "object":"video.generation", "status":"in_progress", "status_url", ...}`; polling yields `status=completed` with `url` / `width` / `height` / `duration_seconds`, or `status=failed` with `error`.
+- Delivery is genuinely asynchronous upstream: Doubao first acknowledges with an "预计等待 N 分钟" turn and only posts the video card minutes later. The gateway clicks the player open to read the signed MP4 out of the `<video src>`. `timeout` defaults to 600s (max 900s); a timeout also returns **504**.
+- Jobs live in process memory only (1h TTL, pruned past 64 entries). A gateway restart forgets them — the video still exists in the Doubao conversation.
+
 **`/v1/embeddings` currently returns 501**: the previous implementation produced SHA-256-derived pseudo-vectors that would have polluted any real RAG/vector store. Route embedding traffic to a real backend instead. `/v1/models` also no longer advertises `text-embedding-*` so SDK auto-discovery doesn't pick them up.
 
 ## Error classification
@@ -270,6 +341,42 @@ uv run opentoken config --opentoken-config /path/to/openclaw-config.json
 ```
 
 Atomic write (tmp + os.replace) + chmod 0600 — the patch contains the gateway apiKey.
+
+## Logs & debugging
+
+`opentoken start` logs to the terminal **and** to a rotating file (`~/.opentoken/logs/gateway.log`, 10 MiB × 5 by default):
+
+```bash
+uv run opentoken start                     # INFO by default, writes ~/.opentoken/logs/gateway.log
+uv run opentoken start --log-level debug   # adds composer/click-strategy detail
+uv run opentoken start --log-file none     # terminal only
+tail -f ~/.opentoken/logs/gateway.log
+```
+
+Every line carries a `[request_id]` that matches the `X-Request-Id` response header (a caller-supplied `X-Request-Id` is reused), so one slow request can be followed end to end:
+
+```
+INFO  [3677952b…] opentoken.api: request_complete method=POST path=/v1/chat/completions status=200 elapsed_ms=7.98 streaming=true
+INFO  [3677952b…] opentoken.gateway.router: route_stream model=doubao/doubao-seed-2.0 provider=doubao adapter=BrowserChatAdapter
+INFO  [3677952b…] opentoken.providers.browser: doubao_stream_start model=doubao-seed-2.0 path=dom-first message_chars=18
+DEBUG [3677952b…] opentoken.providers.browser: doubao_composer_filled strategy=keystrokes
+DEBUG [3677952b…] opentoken.providers.browser: doubao_send_click path=js
+INFO  [3677952b…] opentoken.providers.browser: doubao_dom_first_token first_token_ms=6758
+INFO  [3677952b…] opentoken.providers.browser: doubao_dom_stream_finished emitted_chars=5 total_ms=7407
+INFO  [3677952b…] opentoken.api.chat: stream_complete finish_reason=stop content_chars=5 elapsed_ms=19466
+```
+
+For an SSE response, `request_complete` only means the **headers** went out (`streaming=true` → `elapsed_ms` is not the total); the real total is `stream_complete`. Fields worth watching:
+
+| Field | Meaning |
+| --- | --- |
+| `elapsed_ms` / `total_ms` | per-stage duration |
+| `first_token_ms` | time to first token (browser session/page setup + upstream thinking) |
+| `strategy` | how the composer was filled; `fill-fallback` means newlines got flattened — investigate |
+| `doubao_submit_missing` | the send click produced no `/chat/completion` POST; auto-reloads and retries once |
+| `doubao_stream_path_failed` | one path failed and fell through to the other (with `detail`) |
+
+Environment: `OPENTOKEN_LOG_LEVEL`, `OPENTOKEN_LOG_FILE` (set to `none` to disable the file).
 
 ## Troubleshooting
 

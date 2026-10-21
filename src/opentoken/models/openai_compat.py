@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from opentoken.config.paths import resolve_providers_dir
+from opentoken.models.capabilities import normalize_capability
 from opentoken.models.catalog import ModelCatalogEntry
 from opentoken.models.discovery import load_model_catalog
 from opentoken.models.model_aliases import list_provider_aliases, normalize_provider_model
@@ -77,6 +78,7 @@ def build_openai_model_objects(
                 "id": bare_id,
                 "object": "model",
                 "owned_by": "opentoken",
+                "capability": normalize_capability(entry.capability),
             },
         )
 

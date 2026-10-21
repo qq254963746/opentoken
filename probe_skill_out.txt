@@ -1,0 +1,7 @@
+chips found after wait: ['视频生成', '图像生成', 'PPT 生成', '帮我写作', '录音转写', '更多']
+placeholder before: '发消息或按住空格说话...'
+placeholder after: '描述你想要的视频'
+{
+  "buttons": [],
+  "placeholder": "描述你想要的视频"
+}

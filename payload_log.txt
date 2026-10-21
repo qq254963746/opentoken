@@ -1,0 +1,104 @@
+
+########## 1. JSON with bare base64 image ##########
+2026-10-21 21:33:52 INFO  [64bb0ffadcf244eea6a3ca718a9ff7ac] opentoken.api.payload: api_request method=POST path=/v1/videos content_type=application/json body={
+  "prompt": "让这只猫跑起来",
+  "model": "doubao/seedance-2.0-mini",
+  "seconds": "8",
+  "size": "1280x720",
+  "input_reference": "*** (base64, 132 chars)"
+}
+2026-10-21 21:33:52 INFO  [64bb0ffadcf244eea6a3ca718a9ff7ac] opentoken.api.payload: api_response method=POST path=/v1/videos status=200 content_type=application/json body={
+  "id": "vidgen-3c600b658b624e4cb67503f0f1df3978",
+  "object": "video",
+  "model": "doubao/seedance-2.0-mini",
+  "status": "in_progress",
+  "progress": 1,
+  "created_at": 1792589632,
+  "seconds": "8",
+  "size": "1280x720",
+  "remixed_from_video_id": null,
+  "error": null
+}
+2026-10-21 21:33:52 INFO  [64bb0ffadcf244eea6a3ca718a9ff7ac] opentoken.api: request_complete request_id=64bb0ffadcf244eea6a3ca718a9ff7ac method=POST path=/v1/videos status=200 elapsed_ms=5.39 streaming=false
+HTTP 200
+
+########## 2. GET the job ##########
+2026-10-21 21:33:52 INFO  [fea86733e311461da30a1e5f4265343d] opentoken.api.payload: api_request method=GET path=/v1/videos/vidgen-3c600b658b624e4cb67503f0f1df3978 body=<none>
+2026-10-21 21:33:52 INFO  [fea86733e311461da30a1e5f4265343d] opentoken.api.payload: api_response method=GET path=/v1/videos/vidgen-3c600b658b624e4cb67503f0f1df3978 status=200 content_type=application/json body={
+  "id": "vidgen-3c600b658b624e4cb67503f0f1df3978",
+  "object": "video",
+  "model": "doubao/seedance-2.0-mini",
+  "status": "in_progress",
+  "progress": 1,
+  "created_at": 1792589632,
+  "seconds": "8",
+  "size": "1280x720",
+  "remixed_from_video_id": null,
+  "error": null
+}
+2026-10-21 21:33:52 INFO  [fea86733e311461da30a1e5f4265343d] opentoken.api: request_complete request_id=fea86733e311461da30a1e5f4265343d method=GET path=/v1/videos/vidgen-3c600b658b624e4cb67503f0f1df3978 status=200 elapsed_ms=2.88 streaming=false
+
+########## 3. multipart with a file part ##########
+2026-10-21 21:33:52 INFO  [d8c38a0e5d1c4765ae700dd266cbf868] opentoken.api.payload: api_request method=POST path=/v1/videos content_type=multipart/form-data; boundary=e7bf5110acdd0462cf4950de04d30f78 body={
+  "prompt": "让这只猫跑起来",
+  "model": "doubao/seedance-2.0-mini",
+  "input_reference": {
+    "filename": "cat.png",
+    "content_type": "image/png",
+    "bytes": 99
+  }
+}
+2026-10-21 21:33:52 INFO  [d8c38a0e5d1c4765ae700dd266cbf868] opentoken.api.payload: api_response method=POST path=/v1/videos status=200 content_type=application/json body={
+  "id": "vidgen-758848a1498e481f93c9b870e5fcd619",
+  "object": "video",
+  "model": "doubao/seedance-2.0-mini",
+  "status": "in_progress",
+  "progress": 1,
+  "created_at": 1792589632,
+  "seconds": null,
+  "size": null,
+  "remixed_from_video_id": null,
+  "error": null
+}
+2026-10-21 21:33:52 INFO  [d8c38a0e5d1c4765ae700dd266cbf868] opentoken.api: request_complete request_id=d8c38a0e5d1c4765ae700dd266cbf868 method=POST path=/v1/videos status=200 elapsed_ms=3.28 streaming=false
+
+########## 4. audio rejected ##########
+2026-10-21 21:33:52 INFO  [7b4bc43583e8432499209fdf2fe8c5c8] opentoken.api.payload: api_request method=POST path=/v1/videos content_type=application/json body={
+  "prompt": "一只猫",
+  "audio": "https://cdn.example/bgm.mp3"
+}
+2026-10-21 21:33:52 INFO  [7b4bc43583e8432499209fdf2fe8c5c8] opentoken.api.payload: api_response method=POST path=/v1/videos status=400 content_type=application/json body={
+  "error": {
+    "message": "Audio is not supported ('audio'): Doubao's web video skill generates silent video and has no audio input — its upload input takes images only (jpg/png/webp/apng). An audio file forced through it is attached as a broken image, so it is rejected instead of being ignored. Describe the soundscape in `prompt`, or add audio after the render.",
+    "type": "invalid_request_error",
+    "param": "audio"
+  }
+}
+2026-10-21 21:33:52 INFO  [7b4bc43583e8432499209fdf2fe8c5c8] opentoken.api: request_complete request_id=7b4bc43583e8432499209fdf2fe8c5c8 method=POST path=/v1/videos status=400 elapsed_ms=0.84 streaming=false
+
+########## 5. images endpoint ##########
+node:events:486
+      throw er; // Unhandled 'error' event
+      ^
+
+Error: write EPIPE
+    at afterWriteDispatched (node:internal/stream_base_commons:159:15)
+    at writeGeneric (node:internal/stream_base_commons:150:3)
+    at Socket._writeGeneric (node:net:966:11)
+    at Socket._write (node:net:978:8)
+    at writeOrBuffer (node:internal/streams/writable:570:12)
+    at _write (node:internal/streams/writable:499:10)
+    at Writable.write (node:internal/streams/writable:508:10)
+    at PipeTransport.send (/Users/hugui/Documents/kwai/Worksapce/composite/opentoken/.venv/lib/python3.14/site-packages/playwright/driver/package/lib/server/utils/pipeTransport.js:52:21)
+    at dispatcherConnection.onmessage (/Users/hugui/Documents/kwai/Worksapce/composite/opentoken/.venv/lib/python3.14/site-packages/playwright/driver/package/lib/cli/driver.js:60:59)
+    at DispatcherConnection.sendDispose (/Users/hugui/Documents/kwai/Worksapce/composite/opentoken/.venv/lib/python3.14/site-packages/playwright/driver/package/lib/server/dispatchers/dispatcher.js:187:10)
+Emitted 'error' event on Socket instance at:
+    at emitErrorNT (node:internal/streams/destroy:170:8)
+    at emitErrorCloseNT (node:internal/streams/destroy:129:3)
+    at process.processTicksAndRejections (node:internal/process/task_queues:89:21) {
+  errno: -32,
+  code: 'EPIPE',
+  syscall: 'write'
+}
+
+Node.js v24.13.0

@@ -122,3 +122,52 @@ def test_project_via_projector_handles_unclosed_inner_hidden_tag() -> None:
     # The close of think must eventually appear once we send it.
     projector2.push('</think>after')
     assert projector2.visible_text == "<think>reason here</think>after"
+
+
+def test_run_blocking_with_heartbeat_emits_keepalives_while_a_call_blocks() -> None:
+    """A non-stream provider call must not leave the SSE connection silent.
+
+    Browser adapters answer tool-carrying requests through `router.chat`, which
+    can block for a minute; without keepalives clients hit their read timeout and
+    abort a request that is still progressing.
+    """
+    import threading
+    import time
+
+    from opentoken.api.routes.chat import _run_blocking_with_heartbeat
+
+    release = threading.Event()
+
+    def slow_call() -> str:
+        release.wait(timeout=5)
+        return "answer"
+
+    kinds: list[str] = []
+
+    def consume() -> None:
+        for kind, value in _run_blocking_with_heartbeat(slow_call, interval=0.01):
+            kinds.append(kind)
+            if kind == "item":
+                assert value == "answer"
+
+    worker = threading.Thread(target=consume, daemon=True)
+    worker.start()
+    time.sleep(0.1)
+    release.set()
+    worker.join(timeout=5)
+
+    assert kinds.count("heartbeat") >= 2
+    assert kinds[-1] == "item"
+
+
+def test_run_blocking_with_heartbeat_surfaces_the_call_error() -> None:
+    from opentoken.api.routes.chat import _run_blocking_with_heartbeat
+
+    def boom() -> str:
+        raise RuntimeError("upstream died")
+
+    events = list(_run_blocking_with_heartbeat(boom, interval=0.01))
+
+    assert events[0][0] == "error"
+    assert isinstance(events[0][1], RuntimeError)
+    assert len(events) == 1

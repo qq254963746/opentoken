@@ -246,10 +246,14 @@ def _verify_models(
         if len(matches) != 1:
             return _failed_detail("models", f"model {model} missing from catalog")
         item = matches[0]
-        if set(item.keys()) != {"id", "object", "owned_by"}:
+        if set(item.keys()) != {"id", "object", "owned_by", "capability"}:
             return _failed_detail("models", f"unexpected model keys: {sorted(item.keys())}")
         if item["object"] != "model":
             return _failed_detail("models", f"unexpected model object: {item['object']}")
+        if item["capability"] != "text":
+            return _failed_detail(
+                "models", f"unexpected model capability: {item['capability']}"
+            )
         return EndpointVerificationResult(
             name="models",
             status="passed",

@@ -7,14 +7,21 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from opentoken.api.auth import maybe_require_api_key
+from opentoken.api.payload_logging import PayloadLoggingMiddleware
 from opentoken.api.routes.chat import router as chat_router
 from opentoken.api.routes.embeddings import router as embeddings_router
 from opentoken.api.routes.files import router as files_router
 from opentoken.api.routes.health import router as health_router
+from opentoken.api.routes.images import router as images_router
 from opentoken.api.routes.models import router as models_router
 from opentoken.api.routes.responses import router as responses_router
 from opentoken.api.routes.uploads import router as uploads_router
+from opentoken.api.routes.videos import router as videos_router
 from opentoken.config.gateway_config import load_gateway_config
+from opentoken.logging_setup import (
+    reset_request_id,
+    set_request_id,
+)
 
 
 logger = logging.getLogger("opentoken.api")
@@ -42,6 +49,12 @@ def _path_is_unbounded(path: str) -> bool:
 def create_app() -> FastAPI:
     app = FastAPI(title="OpenToken")
     _bootstrap_gateway_config()
+
+    # Registered first so it ends up *innermost* (Starlette wraps in reverse):
+    # it then runs after `assign_request_id`, so every line it logs is stamped
+    # with the caller's request id, and after auth, so rejected calls aren't
+    # logged as if they reached a route.
+    app.add_middleware(PayloadLoggingMiddleware)
 
     @app.middleware("http")
     async def enforce_request_body_size(request: Request, call_next):
@@ -84,6 +97,10 @@ def create_app() -> FastAPI:
     async def assign_request_id(request: Request, call_next):
         request_id = request.headers.get("X-Request-Id") or uuid.uuid4().hex
         request.state.request_id = request_id
+        # Also publish it to a context var so every log line produced anywhere
+        # under this request (gateway router, provider browser workers) is
+        # stamped with the same id the caller sees in the X-Request-Id header.
+        token = set_request_id(request_id)
         started_ns = time.perf_counter_ns()
         try:
             response = await call_next(request)
@@ -96,17 +113,28 @@ def create_app() -> FastAPI:
                 request.url.path,
                 elapsed_ms,
             )
+            reset_request_id(token)
             raise
         elapsed_ms = (time.perf_counter_ns() - started_ns) / 1e6
         response.headers["X-Request-Id"] = request_id
+        # For an SSE response this measures time-to-headers only; the body keeps
+        # streaming afterwards and is timed by the route's own `stream_complete`
+        # line, so `streaming=true` flags that `elapsed_ms` is not the total.
+        streaming = str(response.headers.get("content-type", "")).startswith("text/event-stream")
         logger.info(
-            "request_complete request_id=%s method=%s path=%s status=%s elapsed_ms=%.2f",
+            "request_complete request_id=%s method=%s path=%s status=%s elapsed_ms=%.2f streaming=%s",
             request_id,
             request.method,
             request.url.path,
             response.status_code,
             elapsed_ms,
+            str(streaming).lower(),
         )
+        # Reset only after the line above so its `[request_id]` prefix matches.
+        # A streaming body is pumped by a task spawned inside `call_next`, which
+        # captured this context, so provider logs emitted while streaming still
+        # carry the id.
+        reset_request_id(token)
         return response
 
     @app.exception_handler(Exception)
@@ -139,6 +167,8 @@ def create_app() -> FastAPI:
     app.include_router(embeddings_router)
     app.include_router(chat_router)
     app.include_router(responses_router)
+    app.include_router(images_router)
+    app.include_router(videos_router)
     return app
 
 

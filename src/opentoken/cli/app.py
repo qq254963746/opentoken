@@ -12,6 +12,7 @@ from opentoken.config.paths import (
     resolve_providers_dir,
     resolve_state_dir,
 )
+from opentoken.logging_setup import configure_logging
 from opentoken.models.provider_credentials import ProviderCredentialRecord
 from opentoken.opentoken.bridge import (
     apply_algae_provider_patch,
@@ -194,12 +195,29 @@ def login(
 def start(
     host: str | None = typer.Option(None, '--host'),
     port: int | None = typer.Option(None, '--port'),
+    log_level: str | None = typer.Option(
+        None,
+        '--log-level',
+        help='Logging level (debug, info, warning, error). Defaults to $OPENTOKEN_LOG_LEVEL or info.',
+    ),
+    log_file: str | None = typer.Option(
+        None,
+        '--log-file',
+        help=(
+            'Rotating log file. Defaults to <state dir>/logs/gateway.log; '
+            'pass "none" to log to the terminal only.'
+        ),
+    ),
 ) -> None:
     """Start the opentoken gateway service."""
     initialize_state_dir(resolve_state_dir())
     config = load_or_create_app_config(resolve_app_config_path())
     bind_host = host or str(config['host'])
     bind_port = port or int(config['port'])
+    active_log_file = configure_logging(
+        log_level,
+        log_file='auto' if log_file is None else log_file,
+    )
     if not _is_loopback_host(bind_host):
         # Binding a non-loopback address exposes the gateway — and every logged-
         # in provider session it proxies — to the local network (or the
@@ -220,11 +238,17 @@ def start(
                 fg=typer.colors.RED,
             )
     typer.echo(f'Starting OpenToken on http://{bind_host}:{bind_port}')
+    if active_log_file is not None:
+        typer.echo(f'Logging to {active_log_file}')
     uvicorn.run(
         'opentoken.api.app:create_app',
         factory=True,
         host=bind_host,
         port=bind_port,
+        # We own logging: passing log_config=None stops uvicorn from installing
+        # its own stream-only handlers, so its startup/access lines flow through
+        # the rotating file handler configured above instead of being lost.
+        log_config=None,
     )
 
 

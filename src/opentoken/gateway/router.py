@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 from opentoken.config.paths import resolve_providers_dir
 from opentoken.failover.errors import NonRetryableError, RetryableError, normalize_error
@@ -29,8 +30,12 @@ from opentoken.providers.qwen import QwenCnWebAdapter, QwenWebAdapter
 from opentoken.providers.unified_proxy import UnifiedProxyAdapter
 from opentoken.failover.model_chain import chain_from_credentials, run_with_chain, stream_with_chain
 from opentoken.models.openai_compat import resolve_requested_model
+from opentoken.models.media import IMAGE, VIDEO, resolve_media_model
 from opentoken.providers.registry import supported_provider_keys
 from opentoken.storage.provider_store import load_provider_credentials
+
+if TYPE_CHECKING:
+    from opentoken.providers.doubao_media import MediaAsset
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +135,9 @@ class PoolAwareRouter:
                 f"Missing {provider_name} credentials. Run `opentoken login {provider_name}` first."
             )
 
+        logger.info(
+            "route_chat model=%s provider=%s stream=false", request.model, provider_name
+        )
         if provider_name in _HTTP_PROVIDERS:
             return self._call_http_provider(provider_name, request, credentials)
         elif provider_name in _BROWSER_PROVIDERS:
@@ -158,10 +166,25 @@ class PoolAwareRouter:
 
         adapter = self._http_adapters.get(provider_name)
         if adapter is None:
+            logger.info(
+                "route_stream model=%s provider=%s adapter=none", request.model, provider_name
+            )
             return None
         stream_method = getattr(adapter, "stream_chat", None)
         if not callable(stream_method):
+            logger.info(
+                "route_stream model=%s provider=%s adapter=%s stream=unsupported",
+                request.model,
+                provider_name,
+                type(adapter).__name__,
+            )
             return None
+        logger.info(
+            "route_stream model=%s provider=%s adapter=%s",
+            request.model,
+            provider_name,
+            type(adapter).__name__,
+        )
         if provider_name in _CHAINABLE_PROVIDERS:
             chain = chain_from_credentials(credentials if hasattr(credentials, "metadata") else None)
             return stream_with_chain(
@@ -170,6 +193,64 @@ class PoolAwareRouter:
                 lambda req: stream_method(req, credentials),
             )
         return stream_method(request, credentials)
+
+    def generate_images(
+        self,
+        *,
+        model: str,
+        prompt: str,
+        count: int = 1,
+        timeout_seconds: float = 240.0,
+    ) -> list["MediaAsset"]:
+        """Render images through a browser provider (currently Doubao/Seedream).
+
+        Media generation is browser-only: the providers expose it through a
+        logged-in web session, not an HTTP API, so it deliberately bypasses the
+        pool and talks to the same Camoufox client the chat adapters use.
+        """
+        resolved = resolve_media_model(model, kind=IMAGE)
+        if resolved is None:
+            raise RuntimeError(f"Unsupported image model: {model}")
+        client = self._media_client(resolved.provider)
+        return client.generate_images(
+            message=prompt,
+            model=resolved.id,
+            count=count,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def generate_video(
+        self,
+        *,
+        model: str,
+        prompt: str,
+        timeout_seconds: float = 600.0,
+        seconds: int | None = None,
+        size: str | None = None,
+        reference_images: list[Path] | tuple[Path, ...] = (),
+    ) -> "MediaAsset":
+        resolved = resolve_media_model(model, kind=VIDEO)
+        if resolved is None:
+            raise RuntimeError(f"Unsupported video model: {model}")
+        client = self._media_client(resolved.provider)
+        return client.generate_video(
+            message=prompt,
+            model=resolved.id,
+            timeout_seconds=timeout_seconds,
+            seconds=seconds,
+            size=size,
+            reference_images=reference_images,
+        )
+
+    def _media_client(self, provider: str) -> CamoufoxProviderClient:
+        if provider != "doubao":
+            raise RuntimeError(f"Media generation is not supported for provider: {provider}")
+        credentials = load_provider_credentials(self._providers_dir, provider)
+        if credentials is None:
+            raise RuntimeError(
+                f"Missing {provider} credentials. Run `opentoken login {provider}` first."
+            )
+        return CamoufoxProviderClient(provider, credentials)
 
     def _call_http_provider(
         self,

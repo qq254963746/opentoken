@@ -7,6 +7,7 @@ import threading
 from typing import Protocol
 
 from opentoken.gateway.normalized import NormalizedChatRequest
+from opentoken.logging_setup import current_request_id, reset_request_id, set_request_id
 from opentoken.models.model_aliases import normalize_provider_model
 from opentoken.models.provider_credentials import ProviderCredentialRecord
 from opentoken.providers.base import ChatResponse, ProviderAdapter
@@ -252,7 +253,19 @@ def _run_browser_completion(
     and block until a result is available (or *timeout_seconds* elapses)."""
     worker = _get_or_create_worker(provider_name)
     result_queue: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
-    worker.task_queue.put((invoke, result_queue))
+    # Capture the caller's logging context before hopping threads: a fresh
+    # thread starts with an empty context, so provider log lines would otherwise
+    # lose the request id that ties them to the API log line.
+    request_id = current_request_id()
+
+    def invoke_with_context() -> str:
+        token = set_request_id(request_id)
+        try:
+            return invoke()
+        finally:
+            reset_request_id(token)
+
+    worker.task_queue.put((invoke_with_context, result_queue))
 
     try:
         ok, payload = result_queue.get(timeout=timeout_seconds)
@@ -288,8 +301,10 @@ def _run_browser_stream(
     worker = _get_or_create_worker(provider_name)
     stream_queue: queue.Queue[tuple[str, object | None]] = queue.Queue()
     cancel_event = threading.Event()
+    request_id = current_request_id()
 
     def driver() -> str:
+        token = set_request_id(request_id)
         iterator = None
         terminal_sent = False
         try:
@@ -320,6 +335,7 @@ def _run_browser_stream(
                         terminal_sent = True
             if not terminal_sent:
                 stream_queue.put(("done", None))
+            reset_request_id(token)
         return ""
 
     # Submit the driver to the persistent worker. We don't read the result queue —
